@@ -5,7 +5,7 @@ volumes:
   weaviate-data:
 
 services:
-# ───────────── data layer ─────────────
+# ───────── data layer ─────────
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
@@ -28,12 +28,12 @@ services:
     depends_on:
       - redis
 
-# ───────────── MCP façades ─────────────
+# ───────── MCP façades ─────────
   mcp-openshift:
     build: ./mcp-openshift
     environment:
-      MCP_USERNAME: admin
-      MCP_PASSWORD: secret
+      MCP_USERNAME: ${MCP_USERNAME:-admin}
+      MCP_PASSWORD: ${MCP_PASSWORD:-secret}
       KUBECONFIG: /app/.kube/config
     ports: ["9000:9000"]
     restart: unless-stopped
@@ -41,30 +41,37 @@ services:
   mcp-fmp:
     build: ./mcp-fmp
     environment:
-      MCP_USERNAME: admin
-      MCP_PASSWORD: secret
-      FMP_API_KEY: ${FMP_API_KEY}
+      MCP_USERNAME: ${MCP_USERNAME:-admin}
+      MCP_PASSWORD: ${MCP_PASSWORD:-secret}
+      FMP_API_KEY:  ${FMP_API_KEY}
     ports: ["9100:9000"]
     restart: unless-stopped
 
-# ───────────── agent (FastAPI + RAG) ─────────────
+# ───────── agent (FastAPI + RAG) ─────────
   agent-server:
     build: .
     ports: ["8000:8000"]
     environment:
-      # --- LLM backend ---
-      LLM_BACKEND: openai                 # <─ switch
-      OPENAI_API_KEY: ${OPENAI_API_KEY}   # <─ read from .env or shell
-      # LLM_BASE_URL no longer needed → delete or comment out
-      #
-      WEAVIATE_URL: http://weaviate:8080
+      # LLM
+      LLM_BACKEND: openai
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+
+      # internal service addresses
       REDIS_HOST: redis
-      MCP_BASE_URL: http://mcp-openshift:9000
-      MCP_USERNAME: admin
-      MCP_PASSWORD: secret
-      ADMIN_TOKEN: supersecrettoken
+      WEAVIATE_URL: http://weaviate:8080
+      MCP_FMP_URL:  http://mcp-fmp:9000
+      MCP_K8S_URL:  http://mcp-openshift:9000
+      MCP_USERNAME: ${MCP_USERNAME:-admin}
+      MCP_PASSWORD: ${MCP_PASSWORD:-secret}
+
+      # auth
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-supersecrettoken}
+
+      # host-only (optional; remove if unused)
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+
     volumes:
-      - ./:/app
+      - ./:/app            # hot-reload during dev
     command: >
       uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     restart: unless-stopped
@@ -74,12 +81,12 @@ services:
       - mcp-openshift
       - mcp-fmp
 
-
+# ───────── simple Streamlit UI ─────────
   ui:
     build: ./ui
-    ports: ["8501:8501"]            # localhost:8501
+    ports: ["8501:8501"]
     environment:
       BACKEND_URL: http://agent-server:8000
-      AUTH_TOKEN: supersecrettoken
+      AUTH_TOKEN:  ${ADMIN_TOKEN:-supersecrettoken}
     depends_on:
       - agent-server

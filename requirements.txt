@@ -1,12 +1,12 @@
+# requirements.txt  (agent-server)
 fastapi[all]
 uvicorn
-langchain
+
+langchain-community>=0.2.0
 langchain-openai>=0.0.7
-langchain-community
 openai
+
 weaviate-client>=3.26.7,<4.0.0
+sentence-transformers
+redis>=4.6.0
 python-dotenv
-kubernetes
-redis
-streamlit
-requests

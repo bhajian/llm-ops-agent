@@ -1,11 +1,17 @@
-# --- app/config.py ---
+# app/config.py
 import os
-from dotenv import load_dotenv
-load_dotenv()
 
 def get_settings():
     return {
-        "llm_backend": os.getenv("LLM_BACKEND", "lmstudio"),
-        "llm_base_url": os.getenv("LLM_BASE_URL", "http://localhost:1234/v1"),
-        "weaviate_url": os.getenv("WEAVIATE_URL", "http://localhost:8080")
+        "redis_host":    os.getenv("REDIS_HOST", "redis"),
+        "weaviate_url":  os.getenv("WEAVIATE_URL", "http://weaviate:8080"),
+
+        # micro-control-planes
+        "mcp_fmp_url":   os.getenv("MCP_FMP_URL",  "http://mcp-fmp:9000"),
+        "mcp_k8s_url":   os.getenv("MCP_K8S_URL",  "http://mcp-openshift:9000"),
+        "mcp_username":  os.getenv("MCP_USERNAME", "admin"),
+        "mcp_password":  os.getenv("MCP_PASSWORD", "secret"),
+
+        # LLM
+        "llm_base_url":  os.getenv("LLM_BASE_URL", ""),
     }
