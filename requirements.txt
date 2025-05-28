@@ -1,8 +1,12 @@
-fastapi
+fastapi[all]
 uvicorn
 langchain
+langchain-openai>=0.0.7
+langchain-community
 openai
-weaviate-client
+weaviate-client>=3.26.7,<4.0.0
 python-dotenv
 kubernetes
-langchain-core
+redis
+streamlit
+requests

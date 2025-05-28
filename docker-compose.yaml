@@ -1,0 +1,85 @@
+version: "3.9"
+
+volumes:
+  redis-data:
+  weaviate-data:
+
+services:
+# ───────────── data layer ─────────────
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  weaviate:
+    image: semitechnologies/weaviate:1.24.8
+    ports: ["8080:8080"]
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      DEFAULT_VECTORIZER_MODULE: text2vec-openai
+      ENABLE_MODULES: text2vec-openai,text2vec-huggingface
+      OPENAI_APIKEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - weaviate-data:/var/lib/weaviate
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+# ───────────── MCP façades ─────────────
+  mcp-openshift:
+    build: ./mcp-openshift
+    environment:
+      MCP_USERNAME: admin
+      MCP_PASSWORD: secret
+      KUBECONFIG: /app/.kube/config
+    ports: ["9000:9000"]
+    restart: unless-stopped
+
+  mcp-fmp:
+    build: ./mcp-fmp
+    environment:
+      MCP_USERNAME: admin
+      MCP_PASSWORD: secret
+      FMP_API_KEY: ${FMP_API_KEY}
+    ports: ["9100:9000"]
+    restart: unless-stopped
+
+# ───────────── agent (FastAPI + RAG) ─────────────
+  agent-server:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      # --- LLM backend ---
+      LLM_BACKEND: openai                 # <─ switch
+      OPENAI_API_KEY: ${OPENAI_API_KEY}   # <─ read from .env or shell
+      # LLM_BASE_URL no longer needed → delete or comment out
+      #
+      WEAVIATE_URL: http://weaviate:8080
+      REDIS_HOST: redis
+      MCP_BASE_URL: http://mcp-openshift:9000
+      MCP_USERNAME: admin
+      MCP_PASSWORD: secret
+      ADMIN_TOKEN: supersecrettoken
+    volumes:
+      - ./:/app
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - weaviate
+      - mcp-openshift
+      - mcp-fmp
+
+
+  ui:
+    build: ./ui
+    ports: ["8501:8501"]            # localhost:8501
+    environment:
+      BACKEND_URL: http://agent-server:8000
+      AUTH_TOKEN: supersecrettoken
+    depends_on:
+      - agent-server
