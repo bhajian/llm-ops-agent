@@ -1,48 +1,48 @@
-import uuid
 import streamlit as st
-from client import stream_chat, load_history
-from sidebar import render_chat_sidebar  # 👈 you modularized this
+from client import stream_chat
+from sidebar import render_chat_sidebar
 
 st.set_page_config(page_title="LLM DevOps · Chat", page_icon="💬")
 
-# ─── Session State Init ───────────────────────────────────────
-if "chat_id" not in st.session_state:
-    st.session_state.chat_id = str(uuid.uuid4())
-
-chat_id = st.session_state.chat_id
-
-# ─── Sidebar ──────────────────────────────────────────────────
+# ─── Sidebar UI ───────────────────────────────────────────────
 with st.sidebar:
-    render_chat_sidebar()  # 👈 pulls in the full chat management UI
+    render_chat_sidebar()
 
-# ─── Load history only if missing ─────────────────────────────
-if "messages" not in st.session_state or not st.session_state.messages:
-    st.session_state.messages = load_history(chat_id)
+# ─── Current chat session ID ──────────────────────────────────
+chat_id = st.session_state.get("chat_id")
+if not chat_id:
+    st.warning("No chat session selected.")
+    st.stop()
 
-# ─── Chat UI Display ──────────────────────────────────────────
+# Use per-chat message key
+key = f"messages_{chat_id}"
+
+# ─── Initialize chat history if missing ───────────────────────
+if key not in st.session_state:
+    st.session_state[key] = []
+
+# ─── Display Chat History ─────────────────────────────────────
 chat_box = st.container()
-for msg in st.session_state.messages:
+for msg in st.session_state[key]:
     with chat_box.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# ─── Input Prompt & Streamed Output ───────────────────────────
-prompt = st.chat_input("Ask me anything…")
+# ─── Input & Streaming Response ───────────────────────────────
+prompt = st.chat_input("Ask me anything...")
 if prompt:
-    # Show user message
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state[key].append({"role": "user", "content": prompt})
     with chat_box.chat_message("user"):
         st.markdown(prompt)
 
-    # Stream assistant response
     with chat_box.chat_message("assistant"):
-        response_block = st.empty()
         full_response = ""
+        block = st.empty()
         try:
             for token in stream_chat(prompt, chat_id):
                 full_response += token
-                response_block.markdown(full_response + "▌")
+                block.markdown(full_response + "▌")
         except Exception as e:
             full_response = f"❌ {e}"
-        response_block.markdown(full_response)
+        block.markdown(full_response)
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+    st.session_state[key].append({"role": "assistant", "content": full_response})

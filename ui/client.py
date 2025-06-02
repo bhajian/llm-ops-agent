@@ -1,7 +1,6 @@
 import os
 import requests
 
-# Base config
 API_BASE = os.getenv("BACKEND_URL", "http://localhost:8000")
 AUTH_HEADER = {"Authorization": os.getenv("AUTH_TOKEN", "supersecrettoken")}
 
@@ -16,7 +15,7 @@ def list_chats():
         return []
 
 
-def delete_chat(chat_id: str):
+def delete_chat(chat_id):
     try:
         r = requests.delete(f"{API_BASE}/history/{chat_id}", headers=AUTH_HEADER, timeout=5)
         r.raise_for_status()
@@ -26,7 +25,7 @@ def delete_chat(chat_id: str):
         return False
 
 
-def load_history(chat_id: str):
+def load_history(chat_id):
     try:
         r = requests.get(f"{API_BASE}/history/{chat_id}", headers=AUTH_HEADER, timeout=5)
         r.raise_for_status()
@@ -36,7 +35,7 @@ def load_history(chat_id: str):
         return []
 
 
-def stream_chat(query: str, chat_id: str):
+def stream_chat(query, chat_id):
     try:
         payload = {"chat_id": chat_id, "query": query}
         with requests.post(
@@ -54,16 +53,12 @@ def stream_chat(query: str, chat_id: str):
         yield f"❌ stream_chat failed: {e}"
 
 
-def ingest_file(uploaded_file):
+def init_chat(chat_id: str, prompt: str = "Hello!"):
     try:
-        files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
-        r = requests.post(
-            f"{API_BASE}/ingest",
-            headers=AUTH_HEADER,
-            files=files,
-            timeout=30,
-        )
+        payload = {"chat_id": chat_id, "query": prompt}
+        r = requests.post(f"{API_BASE}/chat", headers=AUTH_HEADER, json=payload, timeout=10)
         r.raise_for_status()
-        return r.json().get("message", "Uploaded successfully.")
+        return True
     except Exception as e:
-        return f"❌ Upload failed: {e}"
+        print(f"❌ init_chat failed: {e}")
+        return False
