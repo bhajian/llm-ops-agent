@@ -1,71 +1,106 @@
 # app/rag_agent.py
+
 """
-Retrieval-Augmented-Generation helper.
+Backend-agnostic RAG module.
 
  • OPENAI  → ChatOpenAI + OpenAIEmbeddings
- • vLLM / llama.cpp / LM-Studio → OpenAI-compatible chat API + HF embeddings
- • LangChain < 0.2 *and* ≥ 0.2 are both supported
+ • vLLM / llama.cpp → OpenAI-compatible chat + HF embeddings
+ • Works with old (<0.2) *and* new (≥0.2) LangChain trees.
 """
+
 from __future__ import annotations
 
-import weaviate
+import asyncio
 from functools import lru_cache
+from typing import Iterable, List
 
-# LangChain imports changed location in 0.2
-try:  # ≥ 0.2
-    from langchain_community.chains.retrieval_qa.base import RetrievalQA
-except ImportError:  # < 0.2 fallback
-    from langchain.chains.retrieval_qa import RetrievalQA
+from langchain_weaviate.vectorstores import WeaviateVectorStore
 
-from langchain_community.vectorstores import Weaviate as WeaviateVS
+# -------- robust RetrievalQA import (handles many LC versions) ----------
+RetrievalQA = None
+for _path in (
+    "langchain_community.chains.retrieval_qa.base",
+    "langchain_community.chains.retrieval_qa",
+    "langchain.chains.retrieval_qa.base",
+    "langchain.chains.retrieval_qa",
+):
+    try:
+        module = __import__(_path, fromlist=["RetrievalQA"])
+        RetrievalQA = module.RetrievalQA  # type: ignore
+        break
+    except (ImportError, AttributeError):
+        continue
+if RetrievalQA is None:
+    raise ImportError("Could not locate `RetrievalQA` in installed LangChain")
 
 from app.config import get_settings
-from app.weaviate_utils import ensure_document_class
 from app.llm import get_llm, get_embeddings
+from app.tools.weaviate_v4 import connect_weaviate, ensure_document_class
 
+_cfg = get_settings()
 
-_cfg = get_settings()                     # single source of truth
-
-
-# ───────────────── helpers ───────────────────────────────────
+# ───────────────── helpers ───────────────────────────────────────────────
 @lru_cache
-def _client() -> weaviate.Client:
-    """Singleton Weaviate client; ensures the Document class exists."""
-    cli = weaviate.Client(_cfg["weaviate_url"])
-    ensure_document_class(cli)
-    return cli
+def _client():
+    """Singleton Weaviate v4 client with schema ensured and connected."""
+    client = connect_weaviate(_cfg["weaviate_url"])
+    client.connect()
+    ensure_document_class(client)
+    return client
 
+@lru_cache
+def _embedding():
+    return get_embeddings()
 
-# global singletons keep RAM low
-_EMBED = get_embeddings()                 # OpenAI or HF model
-_LLM   = get_llm(streaming=True)          # OpenAI or local vLLM/llama
-
-
-# ───────────────── public factory ────────────────────────────
-def get_cot_rag_chain() -> RetrievalQA:
+# ───────────────── public factory ────────────────────────────────────────
+def get_cot_rag_chain(streaming: bool = False) -> RetrievalQA:
     """
-    Returns a RetrievalQA chain with:
+    Build & return a RetrievalQA chain:
       • Weaviate vector store
-      • 4-doc similarity search
-      • Streaming LLM (cloud or local)
+      • k=4 similarity search
+      • LLM (streaming or not)
     """
-    vectordb  = WeaviateVS(_client(), "Document", "content", _EMBED)
-    retriever = vectordb.as_retriever(search_kwargs={"k": 4})
+    client = _client()
 
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=_LLM,
+    vectordb = WeaviateVectorStore(
+        client=client,
+        index_name="Document",
+        text_key="text",
+        embedding=_embedding(),
+    )
+    retriever = vectordb.as_retriever(search_kwargs={"k": 4})
+    llm = get_llm(streaming=streaming)
+
+    return RetrievalQA.from_chain_type(
+        llm=llm,
         retriever=retriever,
-        chain_type="stuff",               # simplest combine mode
+        chain_type="stuff",
         return_source_documents=True,
+        input_key="query"
     )
 
-    # convenience attributes for router / tests
-    qa_chain.retriever = retriever        # type: ignore[attr-defined]
-    qa_chain.llm       = _LLM             # type: ignore[attr-defined]
-    return qa_chain
+# ───────────────── util: parallel retrieval ─────────────────────────────
+async def run_parallel_searches(
+    queries: Iterable[str],
+    retriever,
+) -> List:
+    """
+    Fire retriever.get_relevant_documents concurrently.
+    Returns a flat list of docs.
+    """
+    tasks = []
+    for q in queries:
+        if hasattr(retriever, "aget_relevant_documents"):
+            tasks.append(retriever.aget_relevant_documents(q))  # async
+        else:
+            tasks.append(asyncio.to_thread(retriever.get_relevant_documents, q))
+    results = await asyncio.gather(*tasks, return_exceptions=False)
 
+    docs = []
+    for batch in results:
+        docs.extend(batch)
+    return docs
 
-# ─── legacy alias for old imports ────────────────────────────
+# ─── legacy alias for old code ───────────────────────────────────────────
 def get_rag_chain():
-    """Back-compat wrapper; prefer `get_cot_rag_chain`."""
     return get_cot_rag_chain()

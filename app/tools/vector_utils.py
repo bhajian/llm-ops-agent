@@ -1,69 +1,71 @@
 # app/tools/vector_utils.py
-"""
-Utilities to ingest raw strings or files into Weaviate.
-"""
 
-import os, re
+import os
 from pathlib import Path
-from typing import Iterable, List
+from typing import List
+from uuid import uuid4
 
-import weaviate
 from langchain_core.documents import Document
-from langchain_community.embeddings import OpenAIEmbeddings, HuggingFaceEmbeddings
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
-from langchain_community.vectorstores import Weaviate
+from langchain_community.embeddings import OpenAIEmbeddings, HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# text-splitter import works for old & new LangChain
-try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-except ImportError:
-    from langchain_community.text_splitter import RecursiveCharacterTextSplitter  # <0.2 fallback
+from app.tools.weaviate_v4 import connect_weaviate, ensure_document_class
 
-from app.config import get_settings
-from app.weaviate_utils import ensure_document_class
-
-
-_SPLITTER = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+# Configuration
+WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8080")
+CLASS_NAME = "Document"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "openai")  # or "huggingface"
 
 
-# ───────── helpers ─────────
-def _embeddings():
-    if os.getenv("OPENAI_API_KEY"):
+def load_file(path: str) -> List[Document]:
+    ext = Path(path).suffix.lower()
+    loader = PyPDFLoader(path) if ext == ".pdf" else TextLoader(path)
+    return loader.load()
+
+
+def get_embeddings():
+    if EMBEDDING_MODEL == "openai":
         return OpenAIEmbeddings()
-    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    else:
+        return HuggingFaceEmbeddings()
 
 
-def _client() -> weaviate.Client:
-    cfg = get_settings()
-    client = weaviate.Client(cfg["weaviate_url"])
-    ensure_document_class(client)
-    return client
+def ingest_file_to_weaviate(file_path: str) -> int:
+    print(f"[INGEST] Loading file: {file_path}")
+    docs = load_file(file_path)
+    print(f"[INGEST] Loaded {len(docs)} raw docs")
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    split_docs = text_splitter.split_documents(docs)
+    print(f"[INGEST] Split into {len(split_docs)} chunks")
+
+    client = connect_weaviate(WEAVIATE_URL)
+    client.connect()  # ✅ required to activate client in 4.15.x
+    ensure_document_class(client, CLASS_NAME)
+    collection = client.collections.get(CLASS_NAME)
+
+    embedding_fn = get_embeddings().embed_documents
+    texts = [d.page_content for d in split_docs]
+    vectors = embedding_fn(texts)
+
+    print("[INGEST] Inserting into Weaviate using batch...")
+    with collection.batch.fixed_size(len(vectors)) as batch:
+        for doc, vector in zip(split_docs, vectors):
+            batch.add_object(
+                properties={
+                    "text": doc.page_content,
+                    "source": doc.metadata.get("source", str(uuid4()))
+                },
+                vector=vector
+            )
+
+    print(f"[INGEST] ✅ Ingested {len(split_docs)} chunks")
+    return len(split_docs)
 
 
-def _db() -> Weaviate:
-    return Weaviate(_client(), "Document", "content", _embeddings())
-
-
-# ───────── public API ─────────
-def ingest_texts(texts: Iterable[str]) -> int:
-    docs: List[Document] = []
-    for txt in texts:
-        for chunk in _SPLITTER.split_text(txt):
-            docs.append(Document(page_content=chunk))
-    if docs:
-        _db().add_documents(docs)
-    return len(docs)
-
-
-def ingest_files(paths: Iterable[str]) -> int:
-    all_texts: List[str] = []
-    for p in paths:
-        path = Path(p)
-        if not path.exists():
-            raise FileNotFoundError(path)
-
-        loader_cls = PyPDFLoader if re.search(r"\.pdf$", path.name, re.I) else TextLoader
-        docs = loader_cls(str(path)).load()
-        all_texts.extend(d.page_content for d in docs)
-
-    return ingest_texts(all_texts)
+def ingest_files(paths: List[str]) -> int:
+    total = 0
+    for path in paths:
+        total += ingest_file_to_weaviate(path)
+    return total

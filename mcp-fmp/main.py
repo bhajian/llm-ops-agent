@@ -1,5 +1,6 @@
 # mcp-fmp/main.py
 import os, base64, secrets, httpx
+import asyncio                       # ← NEW
 from fastapi import FastAPI, Depends, Request, HTTPException, status
 
 app = FastAPI()
@@ -14,7 +15,8 @@ PWD         = os.getenv("MCP_PASSWORD", "secret")
 def verify(request: Request):
     expected = "Basic " + base64.b64encode(f"{USER}:{PWD}".encode()).decode()
     if not secrets.compare_digest(request.headers.get("authorization", ""), expected):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bad credentials")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Bad credentials")
 
 # ───────── low-level proxy ─────────
 async def fmp_get(path: str, **params):
@@ -57,7 +59,5 @@ async def fundamentals(symbol: str, _=Depends(verify)):
 
 @app.get("/fmp/search")
 async def search(query: str, limit: int = 10, _=Depends(verify)):
-    """
-    Company-name & ticker search used by the LLM router to resolve symbols.
-    """
+    """Company-name & ticker search used by the LLM router to resolve symbols."""
     return {"result": await fmp_get("search", query=query, limit=limit)}

@@ -1,4 +1,5 @@
 
+
 volumes:
   redis-data:
   weaviate-data:
@@ -9,7 +10,7 @@ services:
     image: redis:7-alpine
     command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
     volumes:
-      - redis-data:/data
+      - ./data/redis:/data
     restart: unless-stopped
 
   weaviate:
@@ -19,15 +20,11 @@ services:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
 
-      # Default vectorizer matches your current OpenAI embeddings.
-      # When you switch to HF embeddings, change the next two lines to
-      #   DEFAULT_VECTORIZER_MODULE: text2vec-huggingface
-      #   ENABLE_MODULES: text2vec-huggingface
       DEFAULT_VECTORIZER_MODULE: text2vec-openai
       ENABLE_MODULES: text2vec-openai,text2vec-huggingface
-      OPENAI_APIKEY: ${OPENAI_API_KEY:-}        # ignored by HF vectorizer
+      OPENAI_APIKEY: ${OPENAI_API_KEY:-}
     volumes:
-      - weaviate-data:/var/lib/weaviate
+      - ./data/weaviate:/var/lib/weaviate
     restart: unless-stopped
     depends_on: [redis]
 
@@ -55,26 +52,22 @@ services:
     build: .
     ports: ["8000:8000"]
     environment:
-      # ---- LLM selection --------------------------------------------------
-      LLM_BACKEND:  ${LLM_BACKEND:-openai}        # openai | vllm | llama
-      LLM_BASE_URL: ${LLM_BASE_URL:-}             # http://vllm:8000/v1 for local
-      LLM_MODEL:    ${LLM_MODEL:-gpt-4o-mini}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}         # ignored unless backend=openai
+      LLM_BACKEND:  ${LLM_BACKEND:-openai}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL:    ${LLM_MODEL}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
 
-      # ---- internal service addresses ------------------------------------
       REDIS_HOST:   redis
       WEAVIATE_URL: http://weaviate:8080
       MCP_FMP_URL:  http://mcp-fmp:9000
       MCP_K8S_URL:  http://mcp-openshift:9000
       MCP_USERNAME: ${MCP_USERNAME:-admin}
       MCP_PASSWORD: ${MCP_PASSWORD:-secret}
-
-      # ---- auth token shared with UI -------------------------------------
       ADMIN_TOKEN:  ${ADMIN_TOKEN:-supersecrettoken}
 
     volumes:
-      - ./:/app                           # hot-reload during dev
+      - ./:/app
     command: >
       uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     restart: unless-stopped
@@ -87,9 +80,12 @@ services:
     environment:
       BACKEND_URL: http://agent-server:8000
       AUTH_TOKEN:  ${ADMIN_TOKEN:-supersecrettoken}
+      STREAMLIT_SERVER_RUNONSAVE: true
+    volumes:
+      - ./ui:/app
     depends_on: [agent-server]
 
-# (Optional) ────────────── LOCAL vLLM SERVER ──────────────
+# ────────────── OPTIONAL: LOCAL vLLM SERVER ──────────────
 #  vllm:
 #    image: vllm/vllm-openai:latest
 #    command: python -m vllm.entrypoints.openai.api_server \

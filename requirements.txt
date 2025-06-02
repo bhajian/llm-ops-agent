@@ -3,6 +3,7 @@ fastapi[all]~=0.111
 uvicorn[standard]~=0.29
 
 # ───────── LangChain & LLMs ──────
+langchain>=0.1.16
 langchain-community>=0.2.1
 langchain-openai>=0.1.0         # harmless if you run vLLM / llama
 openai>=1.23.0                  # only used when LLM_BACKEND=openai
@@ -12,8 +13,8 @@ langchain-text-splitters>=0.0.1
 sentence-transformers>=2.5.1    # HF embeddings for non-OpenAI back-ends
 
 # ───────── vector store ──────────
-weaviate-client>=4.5.3          # v4 API (works with our code)
-
+weaviate-client>=4.5.3
+langchain-weaviate>=0.0.3
 # ───────── data / utils ──────────
 redis>=5.0
 python-dotenv>=1.0
