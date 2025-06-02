@@ -1,82 +1,183 @@
 # app/fmp_agent.py
-import re, requests
-from typing import Dict, Any
+import json, logging, re, datetime as dt, requests
+from difflib import get_close_matches
+from typing import Dict, Any, Optional
+
+from langchain_openai import ChatOpenAI          # <- light LLM call
+from langchain.prompts import ChatPromptTemplate
 
 from app.config import get_settings
 
 
+# ───────────────────── small utilities ─────────────────────
+def _days_from_phrase(text: str) -> int | None:
+    """Parse '5 days', '2 weeks', 'YTD' → int days."""
+    if re.search(r"\bYTD\b", text, re.I):
+        jan1 = dt.date(dt.date.today().year, 1, 1)
+        return (dt.date.today() - jan1).days
+    m = re.search(r"(\d+)\s*(day|week|month|year)s?", text, re.I)
+    if not m:
+        return None
+    num, unit = int(m.group(1)), m.group(2).lower()
+    return {"day": num, "week": num*7, "month": num*30, "year": num*365}[unit]
+
+
+def _pct(a: float, b: float) -> float:
+    return (a - b) / b * 100 if b else 0.0
+
+
+def _trend(p: float) -> str:
+    return "📈" if p > 0 else "📉" if p < 0 else "➖"
+
+
+# ───────────────────── agent class ─────────────────────────
 class FMPAgent:
-    """
-    Facade over the MCP-FMP micro-service.
-    """
-
-    def __init__(self, base_url: str, user: str, pwd: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.auth     = (user, pwd)         # HTTP Basic creds
-
-    # ───────── public entry ─────────
-    def run(self, query: str) -> str:
-        symbol = self._extract_symbol(query)
-        if symbol is None:
-            return "⚠️ I couldn’t detect a stock symbol in your question."
-
-        q = query.lower()
-
-        if any(w in q for w in ("pe", "p/e", "ratio", "fundamental", "dividend", "market cap", "roe", "eps")):
-            return self._fundamentals(symbol)
-
-        if any(w in q for w in ("history", "historical", "chart", "past")):
-            return self._history(symbol)
-
-        return self._quote(symbol)
-
-    # ───────── helpers ─────────
-    def _quote(self, sym: str) -> str:
-        js = self._get("/quote", symbol=sym)
-        if not js:
-            return f"❌ No quote for {sym}."
-        q = js
-        return f"**{sym}**: ${q['price']:.2f}  ({q['changesPercentage']:+.2f}% today)"
-
-    def _history(self, sym: str) -> str:
-        js = self._get("/historical", symbol=sym, limit=30)
-        prices = js.get("historical", [])
-        if not prices:
-            return f"❌ No historical data for {sym}."
-        close, old = prices[0]["close"], prices[-1]["close"]
-        pct = (close - old) / old * 100
-        return f"{sym} closed at **${close:.2f}** yesterday; 30-day change **{pct:+.1f}%**."
-
-    def _fundamentals(self, sym: str) -> str:
-        js = self._get("/fundamentals", symbol=sym)
-        prof, rat = js["profile"], js["ratios"]
-        if not prof:
-            return f"❌ No fundamentals for {sym}."
-        parts = [
-            f"**{sym} fundamentals (TTM)**",
-            f"P/E **{rat.get('priceEarningsRatioTTM','-')}**",
-            f"EPS **{rat.get('epsTTM','-')}**",
-            f"ROE **{rat.get('returnOnEquityTTM','-')}**",
-            f"Div Yield **{prof.get('lastDiv','-')}**",
-            f"Market Cap **${prof.get('mktCap',0):,}**",
+    _route_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system",
+             "You are a planner. Convert the user's question into JSON.\n"
+             "Keys: metric (quote|fundamentals|history|earnings), "
+             "lookback_days (int or null), additional (string). "
+             "Return only JSON."),
+            ("user", "{question}")
         ]
-        return " | ".join(parts)
+    )
+    _llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
 
-    # REST proxy call
-    def _get(self, endpoint: str, **params) -> Dict[str, Any]:
-        url = f"{self.base_url}{endpoint}"
-        r = requests.get(url, params=params, auth=self.auth, timeout=10)
+    def __init__(self, base: str, user: str, pwd: str):
+        self.base = base.rstrip("/")
+        self.auth = (user, pwd)
+
+    # ------------- public entry -------------
+    def run(self, query: str) -> str:
+        symbol = self._symbol_from_text(query)
+        if not symbol:
+            return "⚠️ I couldn’t map that company name to a stock symbol."
+
+        plan = self._plan(query)
+        m = plan["metric"]
+        if m == "quote":
+            return self._quote(symbol)
+        if m == "fundamentals":
+            return self._fundamentals(symbol)
+        if m == "history":
+            d = plan["lookback_days"] or _days_from_phrase(query) or 30
+            return self._history(symbol, d)
+        if m == "earnings":
+            return self._earnings(symbol)
+        return "🤷 I’m not sure how to answer that."
+
+    # ------------- planning LLM -------------
+    def _plan(self, q: str) -> Dict:
+        try:
+            resp = self._llm.predict_messages(self._route_prompt.format(question=q))
+            return json.loads(resp.content)
+        except Exception:
+            # fallback: heuristic
+            ql = q.lower()
+            if "earn" in ql:
+                return {"metric": "earnings", "lookback_days": None}
+            if any(w in ql for w in ("pe", "p/e", "dividend", "roe", "eps")):
+                return {"metric": "fundamentals", "lookback_days": None}
+            if _days_from_phrase(ql):
+                return {"metric": "history", "lookback_days": _days_from_phrase(ql)}
+            return {"metric": "quote", "lookback_days": None}
+
+    # ------------- quote -------------
+    def _quote(self, sym: str) -> str:
+        js = self._safe("/quote", symbol=sym)
+        if not js:
+            return f"❌ No quote data for {sym}."
+        return f"**{sym}**: ${js['price']:.2f} ({js['changesPercentage']:+.2f}% today)"
+
+    # ------------- fundamentals -------------
+    def _fundamentals(self, sym: str) -> str:
+        data = self._safe("/fundamentals", symbol=sym)
+        if not data:
+            return f"❌ No fundamentals for {sym}."
+        p, r = data["profile"], data["ratios"]
+        return (
+            f"**{sym} fundamentals (TTM)**\n"
+            f"P/E **{r.get('priceEarningsRatioTTM','-')}** | "
+            f"EPS **{r.get('epsTTM','-')}** | "
+            f"ROE **{r.get('returnOnEquityTTM','-')}** | "
+            f"Div Yield **{p.get('lastDiv','-')}** | "
+            f"Market Cap **${p.get('mktCap',0):,}**"
+        )
+
+    # ------------- history -------------
+    def _history(self, sym: str, days: int) -> str:
+        js = self._safe("/historical", symbol=sym, limit=days)
+        closes = [d["close"] for d in js.get("historical", [])] if js else []
+        if len(closes) < 2:
+            return f"❌ Not enough history for {sym}."
+        pct = _pct(closes[0], closes[-1])
+        return (f"**{sym} last {days} days** {_trend(pct)}\n"
+                f"Change {pct:+.1f}% | Avg ${sum(closes)/len(closes):.2f} | "
+                f"High ${max(closes):.2f} | Low ${min(closes):.2f}")
+
+    # ------------- earnings -------------
+    def _earnings(self, sym: str) -> str:
+        js = self._safe("/historical", symbol=sym, limit=2)  # latest + prev
+        hist = js.get("historical", []) if js else []
+        if len(hist) < 1:
+            return f"❌ No earnings data for {sym}."
+        latest = hist[0]
+        prev   = hist[1] if len(hist) > 1 else None
+        pct = _pct(latest["close"], prev["close"]) if prev else 0.0
+        return (f"**{sym} last quarter earnings** {_trend(pct)}\n"
+                f"Close on report day: ${latest['close']:.2f}\n"
+                f"Quarter-over-quarter change: {pct:+.1f}%")
+
+    # ------------- symbol helpers -------------
+    def _symbol_from_text(self, text: str) -> Optional[str]:
+        sym = self._extract_symbol(text)
+        if sym:
+            return sym
+        return self._lookup_symbol(text)
+
+    @staticmethod
+    def _extract_symbol(text: str) -> Optional[str]:
+        m = re.search(r"\b[A-Z]{2,5}\b", text)
+        return m.group(0) if m else None
+
+    def _lookup_symbol(self, text: str) -> Optional[str]:
+        q = re.sub(r"[^a-zA-Z0-9 ]", " ", text).strip()
+        if len(q) < 2:
+            return None
+        js = self._safe("/search", query=q, limit=25)
+        if not js:
+            return None
+        res = js.get("result", [])
+        pool = {f"{r['symbol']} {r['name']}": r["symbol"] for r in res}
+        best = get_close_matches(q, pool.keys(), n=1, cutoff=0.3)
+        if best:
+            return pool[best[0]]
+        # second pass against names only
+        names = {r["name"]: r["symbol"] for r in res}
+        best = get_close_matches(q, names.keys(), n=1, cutoff=0.3)
+        return names[best[0]] if best else None
+
+    # ------------- HTTP helpers -------------
+    def _safe(self, ep: str, **p) -> Dict[str, Any] | None:
+        try:
+            return self._get(ep, **p)
+        except requests.HTTPError as e:
+            logging.debug("FMP %s %s -> %s", ep, p, e.response.status_code)
+            return None
+        except Exception as e:
+            logging.debug("FMP unexpected: %s", e)
+            return None
+
+    def _get(self, ep: str, **params):
+        url = f"{self.base}{ep}"
+        r = requests.get(url, params=params, auth=self.auth, timeout=15)
         r.raise_for_status()
         return r.json()
 
-    @staticmethod
-    def _extract_symbol(text: str) -> str | None:
-        m = re.search(r"\b[A-Z]{1,5}\b", text)
-        return m.group(0) if m else None
 
-
-# ───────── factory ──────────
-def get_fmp_agent() -> FMPAgent:
+# factory ---------------------------------------------------------
+def get_fmp_agent():
     cfg = get_settings()
     return FMPAgent(
         base_url=f"{cfg['mcp_fmp_url']}/fmp",

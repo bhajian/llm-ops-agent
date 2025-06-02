@@ -1,12 +1,16 @@
-# requirements.txt  (agent-server)
+# app/requirements.txt   (or whatever file you COPY into the agent image)
 fastapi[all]
 uvicorn
 
 langchain-community>=0.2.0
 langchain-openai>=0.0.7
+langchain-text-splitters>=0.0.1
 openai
 
 weaviate-client>=3.26.7,<4.0.0
-sentence-transformers
 redis>=4.6.0
+sentence-transformers
 python-dotenv
+
+# --- PDF support ---
+pypdf>=3.16.4
