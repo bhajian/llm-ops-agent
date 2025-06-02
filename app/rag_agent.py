@@ -1,48 +1,71 @@
 # app/rag_agent.py
-import asyncio
-from typing import List, Dict
+"""
+Retrieval-Augmented-Generation helper.
+
+ • OPENAI  → ChatOpenAI + OpenAIEmbeddings
+ • vLLM / llama.cpp / LM-Studio → OpenAI-compatible chat API + HF embeddings
+ • LangChain < 0.2 *and* ≥ 0.2 are both supported
+"""
+from __future__ import annotations
 
 import weaviate
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from functools import lru_cache
+
+# LangChain imports changed location in 0.2
+try:  # ≥ 0.2
+    from langchain_community.chains.retrieval_qa.base import RetrievalQA
+except ImportError:  # < 0.2 fallback
+    from langchain.chains.retrieval_qa import RetrievalQA
+
 from langchain_community.vectorstores import Weaviate as WeaviateVS
-from langchain.chains import create_qa_with_sources_chain
 
 from app.config import get_settings
 from app.weaviate_utils import ensure_document_class
+from app.llm import get_llm, get_embeddings
 
 
-# ─── helpers ───
+_cfg = get_settings()                     # single source of truth
+
+
+# ───────────────── helpers ───────────────────────────────────
+@lru_cache
 def _client() -> weaviate.Client:
-    cfg = get_settings()
-    c = weaviate.Client(cfg["weaviate_url"])
-    ensure_document_class(c)
-    return c
+    """Singleton Weaviate client; ensures the Document class exists."""
+    cli = weaviate.Client(_cfg["weaviate_url"])
+    ensure_document_class(cli)
+    return cli
 
-_SPLITTER = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-_EMBED    = OpenAIEmbeddings()  # fallback to HF handled upstream
 
-def get_rag_chain():
+# global singletons keep RAM low
+_EMBED = get_embeddings()                 # OpenAI or HF model
+_LLM   = get_llm(streaming=True)          # OpenAI or local vLLM/llama
+
+
+# ───────────────── public factory ────────────────────────────
+def get_cot_rag_chain() -> RetrievalQA:
     """
-    Back-compat for code that still does:
-        from app.rag_agent import get_rag_chain
-    It simply returns the new CoT-enabled chain.
+    Returns a RetrievalQA chain with:
+      • Weaviate vector store
+      • 4-doc similarity search
+      • Streaming LLM (cloud or local)
     """
-    return get_cot_rag_chain()
-
-# ─── public: CoT-RAG chain ───
-def get_cot_rag_chain() -> create_qa_with_sources_chain:
-    vectordb = WeaviateVS(_client(), "Document", "content", _EMBED)
+    vectordb  = WeaviateVS(_client(), "Document", "content", _EMBED)
     retriever = vectordb.as_retriever(search_kwargs={"k": 4})
-    llm_answer = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, streaming=True)
-    return create_qa_with_sources_chain(llm_answer, retriever=retriever)
+
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=_LLM,
+        retriever=retriever,
+        chain_type="stuff",               # simplest combine mode
+        return_source_documents=True,
+    )
+
+    # convenience attributes for router / tests
+    qa_chain.retriever = retriever        # type: ignore[attr-defined]
+    qa_chain.llm       = _LLM             # type: ignore[attr-defined]
+    return qa_chain
 
 
-# ─── utility to run searches asynchronously ───
-async def run_parallel_searches(queries: List[str], retriever):
-    loop = asyncio.get_running_loop()
-    coros = [loop.run_in_executor(None, retriever.get_relevant_documents, q)
-             for q in queries]
-    results = await asyncio.gather(*coros)
-    flat = [d for sub in results for d in sub]
-    return flat[:8]            # cap context size
+# ─── legacy alias for old imports ────────────────────────────
+def get_rag_chain():
+    """Back-compat wrapper; prefer `get_cot_rag_chain`."""
+    return get_cot_rag_chain()

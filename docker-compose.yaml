@@ -4,7 +4,7 @@ volumes:
   weaviate-data:
 
 services:
-# ───────── data layer ─────────
+# ────────────── DATA LAYER ──────────────
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
@@ -18,16 +18,20 @@ services:
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+
+      # Default vectorizer matches your current OpenAI embeddings.
+      # When you switch to HF embeddings, change the next two lines to
+      #   DEFAULT_VECTORIZER_MODULE: text2vec-huggingface
+      #   ENABLE_MODULES: text2vec-huggingface
       DEFAULT_VECTORIZER_MODULE: text2vec-openai
       ENABLE_MODULES: text2vec-openai,text2vec-huggingface
-      OPENAI_APIKEY: ${OPENAI_API_KEY:-}
+      OPENAI_APIKEY: ${OPENAI_API_KEY:-}        # ignored by HF vectorizer
     volumes:
       - weaviate-data:/var/lib/weaviate
     restart: unless-stopped
-    depends_on:
-      - redis
+    depends_on: [redis]
 
-# ───────── MCP façades ─────────
+# ────────────── MCP FAÇADES ──────────────
   mcp-openshift:
     build: ./mcp-openshift
     environment:
@@ -46,46 +50,51 @@ services:
     ports: ["9100:9000"]
     restart: unless-stopped
 
-# ───────── agent (FastAPI + RAG) ─────────
+# ────────────── AGENT (FastAPI + RAG) ──────────────
   agent-server:
     build: .
     ports: ["8000:8000"]
     environment:
-      # LLM
-      LLM_BACKEND: openai
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # ---- LLM selection --------------------------------------------------
+      LLM_BACKEND:  ${LLM_BACKEND:-openai}        # openai | vllm | llama
+      LLM_BASE_URL: ${LLM_BASE_URL:-}             # http://vllm:8000/v1 for local
+      LLM_MODEL:    ${LLM_MODEL:-gpt-4o-mini}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}         # ignored unless backend=openai
 
-      # internal service addresses
-      REDIS_HOST: redis
+      # ---- internal service addresses ------------------------------------
+      REDIS_HOST:   redis
       WEAVIATE_URL: http://weaviate:8080
       MCP_FMP_URL:  http://mcp-fmp:9000
       MCP_K8S_URL:  http://mcp-openshift:9000
       MCP_USERNAME: ${MCP_USERNAME:-admin}
       MCP_PASSWORD: ${MCP_PASSWORD:-secret}
 
-      # auth
-      ADMIN_TOKEN: ${ADMIN_TOKEN:-supersecrettoken}
-
-      # host-only (optional; remove if unused)
-      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      # ---- auth token shared with UI -------------------------------------
+      ADMIN_TOKEN:  ${ADMIN_TOKEN:-supersecrettoken}
 
     volumes:
-      - ./:/app            # hot-reload during dev
+      - ./:/app                           # hot-reload during dev
     command: >
       uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     restart: unless-stopped
-    depends_on:
-      - redis
-      - weaviate
-      - mcp-openshift
-      - mcp-fmp
+    depends_on: [redis, weaviate, mcp-openshift, mcp-fmp]
 
-# ───────── simple Streamlit UI ─────────
+# ────────────── SIMPLE STREAMLIT UI ──────────────
   ui:
     build: ./ui
     ports: ["8501:8501"]
     environment:
       BACKEND_URL: http://agent-server:8000
       AUTH_TOKEN:  ${ADMIN_TOKEN:-supersecrettoken}
-    depends_on:
-      - agent-server
+    depends_on: [agent-server]
+
+# (Optional) ────────────── LOCAL vLLM SERVER ──────────────
+#  vllm:
+#    image: vllm/vllm-openai:latest
+#    command: python -m vllm.entrypoints.openai.api_server \
+#             --model /models/llama-3-8b-instruct.Q4_K_M.gguf \
+#             --served-model-name llama-3-8b-instruct
+#    volumes:
+#      - /path/to/gguf:/models
+#    ports: ["8000:8000"]

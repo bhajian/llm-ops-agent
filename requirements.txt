@@ -1,16 +1,21 @@
-# app/requirements.txt   (or whatever file you COPY into the agent image)
-fastapi[all]
-uvicorn
+# ───────── web framework ─────────
+fastapi[all]~=0.111
+uvicorn[standard]~=0.29
 
-langchain-community>=0.2.0
-langchain-openai>=0.0.7
+# ───────── LangChain & LLMs ──────
+langchain-community>=0.2.1
+langchain-openai>=0.1.0         # harmless if you run vLLM / llama
+openai>=1.23.0                  # only used when LLM_BACKEND=openai
 langchain-text-splitters>=0.0.1
-openai
 
-weaviate-client>=3.26.7,<4.0.0
-redis>=4.6.0
-sentence-transformers
-python-dotenv
+# ───────── embeddings (local) ────
+sentence-transformers>=2.5.1    # HF embeddings for non-OpenAI back-ends
 
-# --- PDF support ---
-pypdf>=3.16.4
+# ───────── vector store ──────────
+weaviate-client>=4.5.3          # v4 API (works with our code)
+
+# ───────── data / utils ──────────
+redis>=5.0
+python-dotenv>=1.0
+requests>=2.32
+pypdf>=3.16.4                   # PDF ingestion support

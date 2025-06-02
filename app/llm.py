@@ -1,30 +1,42 @@
 # app/llm.py
-"""
-Central helper to get an OpenAI-compatible LLM runnable.
-Works in both streaming and non-stream modes.
-"""
+from typing import Literal
+from app.config import get_settings
 
-import os
-from langchain_openai import ChatOpenAI
+_cfg = get_settings()
+_BACKEND = _cfg["llm_backend"]          # openai | vllm | llama
 
 
-def get_llm(*, streaming: bool = False, callbacks=None):
-    """
-    Parameters
-    ----------
-    streaming : bool
-        If True, the model will send tokens incrementally.
-    callbacks : list[BaseCallbackHandler] | None
-        Optional LangChain callback handlers.
+# -------- chat model --------
+def get_llm(streaming: bool = False, callbacks=None):
+    if _BACKEND == "openai":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=_cfg["llm_model"],
+            streaming=streaming,
+            callbacks=callbacks,
+            temperature=0,
+        )
 
-    Returns
-    -------
-    ChatOpenAI
-        Configured model object.
-    """
-    return ChatOpenAI(
-        model_name=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        api_key=os.getenv("OPENAI_API_KEY"),
+    # vLLM / llama.cpp / LM Studio (OpenAI-compatible)
+    from langchain_community.chat_models import ChatOpenAI as CompatChat
+    return CompatChat(
+        model_name=_cfg["llm_model"],
+        base_url=_cfg["llm_base_url"],
+        api_key="NA",
         streaming=streaming,
-        callbacks=callbacks or [],
+        callbacks=callbacks,
+        temperature=0,
     )
+
+
+# -------- embedding model --------
+def get_embeddings():
+    if _BACKEND == "openai":
+        try:
+            from langchain_openai import OpenAIEmbeddings
+            return OpenAIEmbeddings()
+        except Exception:
+            pass  # fall through to HF
+
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    return HuggingFaceEmbeddings(model_name=_cfg["embedding_model"])
