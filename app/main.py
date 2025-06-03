@@ -1,5 +1,5 @@
 # app/main.py
-
+# ─────────────────────────────────────────────────────────────
 import os, tempfile, asyncio
 from pathlib import Path
 from typing import AsyncIterator, List
@@ -8,18 +8,16 @@ from fastapi import FastAPI, Depends, Request, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain.callbacks.base import AsyncCallbackHandler
 
+# --- IMPORTS ---
 from app.auth import verify_token
-from app.memory import load_chat, save_chat, format_chat_history, _r
-from app.agent_router import determine_route, route_query
-from app.llm import get_llm
-from app.rag_agent import get_cot_rag_chain
-from app.tools.vector_utils import ingest_file_to_weaviate
+from app.memory import load_chat, save_chat, _r
+from app.agent_router import route_query # <--- THIS IS THE ONLY ROUTER IMPORT NOW
+from app.tools.vector_utils import ingest_file_to_weaviate # For ingest endpoint
 
 app = FastAPI()
 
-
 # ─────────────────────────────────────────────────────────────
-# /chat  (non-stream)
+# /chat  (non-stream) - REFACTORED
 # ─────────────────────────────────────────────────────────────
 @app.post("/chat")
 async def chat(req: Request, user: str = Depends(verify_token)):
@@ -29,34 +27,19 @@ async def chat(req: Request, user: str = Depends(verify_token)):
 
     print(f"💬 /chat received query: {query}")
 
+    # 1. Load history
     history = load_chat(cid)
-    route = await asyncio.to_thread(determine_route, query)
-    print(f"🧭 Routing decision: {route}")
 
-    if route != "RAG":
-        print("⚙️ Handling via non-RAG toolchain")
-        answer = await route_query(query, history, cid)
-        scratch = None
-    else:
-        print("🧠 Handling with COT_RAG")
-        rag_chain = get_cot_rag_chain()
-        formatted_context = format_chat_history(history)
-        full_query = f"{formatted_context}\nUser: {query}" if formatted_context else query
-        result = rag_chain.invoke({"query": full_query})
-        answer = result["result"]
-        scratch = result.get("scratchpad") or None
+    # 2. Delegate EVERYTHING to the agent router. No more if/else logic.
+    # The router is now fully responsible for picking AND running the correct agent.
+    answer = await route_query(query, history, cid) # Calls the async route_query directly
 
-        print("🔍 RAG retrieved chunks:")
-        for i, doc in enumerate(result.get("source_documents", [])):
-            print(f"📄 [Doc {i+1}] {doc.metadata.get('source', '')}:")
-            print(doc.page_content[:300])
-            print("---")
+    print(f"✅ Router returned answer: {answer}")
 
-        print(f"🧠 RAG Answer: {answer}")
+    # 3. Save the final answer
+    save_chat(cid, query, answer) # Removed scratch as it's not consistently returned by all agents now
 
-    save_chat(cid, query, answer, scratch)
     return JSONResponse({"response": answer, "chat_id": cid})
-
 
 # ─────────────────────────────────────────────────────────────
 # token buffer for streaming mode
@@ -78,61 +61,33 @@ class _TokenBuffer(AsyncCallbackHandler):
                 break
             yield tok
 
-
 # ─────────────────────────────────────────────────────────────
-# /chat/stream
+# /chat/stream (streams all answers that support it) - REFACTORED
 # ─────────────────────────────────────────────────────────────
 @app.post("/chat/stream")
 async def chat_stream(req: Request, user: str = Depends(verify_token)):
+    # This endpoint would also be simplified to call a streaming-capable router function.
+    # We can address the complexities of generic streaming after fixing the core logic.
     body = await req.json()
     query = body.get("query", "")
     cid = body.get("chat_id", user)
-
     history = load_chat(cid)
-    route = await asyncio.to_thread(determine_route, query)
 
-    if route != "RAG":
-        answer = await route_query(query, history, cid)
-        save_chat(cid, query, answer)
+    # For now, keeping it simple as discussed, but the full streaming solution
+    # would involve more complex changes to route_query itself.
+    # The non-streaming route_query is called here.
+    answer = await route_query(query, history, cid)
+    save_chat(cid, query, answer)
 
-        async def once():
-            yield answer
-        return StreamingResponse(once(), media_type="text/plain")
-
-    buf = _TokenBuffer()
-    llm = get_llm(streaming=True, callbacks=[buf])
-    rag_chain = get_cot_rag_chain(streaming=True)
-
-    formatted_context = format_chat_history(history)
-    full_query = f"{formatted_context}\nUser: {query}" if formatted_context else query
-
-    async def gen() -> AsyncIterator[str]:
-        run_task = asyncio.create_task(
-            asyncio.to_thread(rag_chain.invoke, {"query": full_query})
-        )
-
-        async for token in buf.aiter():
-            yield token
-
-        result = await run_task
-        answer = result["result"]
-        scratch = result.get("scratchpad") or None
-
-        save_chat(cid, query, answer, scratch)
-        await buf._q.put(None)
-
-    return StreamingResponse(gen(), media_type="text/plain")
-
+    async def once():
+        yield answer
+    return StreamingResponse(once(), media_type="text/plain")
 
 # ─────────────────────────────────────────────────────────────
-# /ingest (PDF / TXT → Weaviate)
+# /ingest (PDF / TXT → Weaviate) - (No changes needed)
 # ─────────────────────────────────────────────────────────────
 def ingest_files(paths: List[str]) -> int:
-    total = 0
-    for path in paths:
-        total += ingest_file_to_weaviate(path)
-    return total
-
+    return sum(ingest_file_to_weaviate(p) for p in paths)
 
 @app.post("/ingest")
 async def ingest(file: UploadFile = File(...), user: str = Depends(verify_token)):
@@ -150,9 +105,8 @@ async def ingest(file: UploadFile = File(...), user: str = Depends(verify_token)
 
     return {"message": f"Ingested {n_chunks} chunks 👍"}
 
-
 # ─────────────────────────────────────────────────────────────
-# /history endpoints
+# /history endpoints - (No changes needed)
 # ─────────────────────────────────────────────────────────────
 @app.get("/history/{chat_id}")
 async def get_history(chat_id: str, user: str = Depends(verify_token)):
@@ -160,13 +114,10 @@ async def get_history(chat_id: str, user: str = Depends(verify_token)):
     sanitized = [{"role": m["role"], "content": m["content"]} for m in raw]
     return {"chat_id": chat_id, "history": sanitized}
 
-
 @app.get("/history/list")
 async def list_chat_ids(user: str = Depends(verify_token)):
     keys = _r.keys("chat:*")
-    chat_ids = [k.split(":")[1] for k in keys]
-    return {"chat_ids": sorted(chat_ids)}
-
+    return {"chat_ids": sorted(k.split(":")[1] for k in keys)}
 
 @app.delete("/history/{chat_id}")
 async def delete_history(chat_id: str, user: str = Depends(verify_token)):

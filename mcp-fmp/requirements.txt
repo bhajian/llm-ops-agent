@@ -1,2 +1,4 @@
-fastapi[all]
-httpx
+fastapi>=0.111
+uvicorn>=0.29
+requests>=2.32
+python-dotenv>=1.0
