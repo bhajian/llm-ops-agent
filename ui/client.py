@@ -62,3 +62,20 @@ def init_chat(chat_id: str, prompt: str = "Hello!"):
     except Exception as e:
         print(f"❌ init_chat failed: {e}")
         return False
+
+def ingest_file(uploaded_file):
+    try:
+        files = {
+            "file": (uploaded_file.name, uploaded_file.getvalue())
+        }
+        r = requests.post(
+            f"{API_BASE}/ingest",
+            headers=AUTH_HEADER,
+            files=files,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json().get("message", "Uploaded successfully.")
+    except Exception as e:
+        return f"❌ Upload failed: {e}"
+    
