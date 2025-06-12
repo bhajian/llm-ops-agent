@@ -3,12 +3,13 @@ fastapi[all]~=0.111
 uvicorn[standard]~=0.29
 
 # ───────── LangChain & LLMs ──────
-langchain>=0.1.16
+langchain>=0.1.17
 langchain-community>=0.2.1
 langchain-openai>=0.1.0         # harmless if you run vLLM / llama
 openai>=1.23.0                  # only used when LLM_BACKEND=openai
 langchain-text-splitters>=0.0.1
-
+langchain-core>=0.2.0
+langchain-mcp-adapters>=0.0.7
 # ───────── embeddings (local) ────
 sentence-transformers>=2.5.1    # HF embeddings for non-OpenAI back-ends
 
@@ -20,3 +21,10 @@ redis>=5.0
 python-dotenv>=1.0
 requests>=2.32
 pypdf>=3.16.4                   # PDF ingestion support
+
+langchain-aws>=0.1.7
+boto3>=1.34
+botocore>=1.34
+
+langchain-google-genai>=0.0.1
+langsmith>=0.1.0

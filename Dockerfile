@@ -1,10 +1,11 @@
-# llm-ops-agent/Dockerfile  (agent-server)
+# llm-ops-agent/Dockerfile  (agent-server)
 FROM python:3.11-slim
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# ADD --verbose HERE to see detailed installation logs
+RUN pip install --no-cache-dir --verbose -r requirements.txt
 
 # copy *entire* repo so `app/` package is present inside container
 COPY . .

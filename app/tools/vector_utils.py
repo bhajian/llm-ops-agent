@@ -7,15 +7,19 @@ from uuid import uuid4
 
 from langchain_core.documents import Document
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
-from langchain_community.embeddings import OpenAIEmbeddings, HuggingFaceEmbeddings
+# REMOVE these specific embedding imports, as we will use app.llm.get_embeddings
+# from langchain_community.embeddings import OpenAIEmbeddings, HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.tools.weaviate_v4 import connect_weaviate, ensure_document_class
+# ADD this import to use the centralized get_embeddings
+from app.llm import get_embeddings # <--- ADD THIS LINE
 
 # Configuration
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8080")
 CLASS_NAME = "Document"
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "openai")  # or "huggingface"
+# REMOVE this local EMBEDDING_MODEL variable
+# EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "openai")  # or "huggingface"
 
 
 def load_file(path: str) -> List[Document]:
@@ -24,11 +28,12 @@ def load_file(path: str) -> List[Document]:
     return loader.load()
 
 
-def get_embeddings():
-    if EMBEDDING_MODEL == "openai":
-        return OpenAIEmbeddings()
-    else:
-        return HuggingFaceEmbeddings()
+# REMOVE this local get_embeddings function
+# def get_embeddings():
+#     if EMBEDDING_MODEL == "openai":
+#         return OpenAIEmbeddings()
+#     else:
+#         return HuggingFaceEmbeddings()
 
 
 def ingest_file_to_weaviate(file_path: str) -> int:
@@ -45,7 +50,8 @@ def ingest_file_to_weaviate(file_path: str) -> int:
     ensure_document_class(client, CLASS_NAME)
     collection = client.collections.get(CLASS_NAME)
 
-    embedding_fn = get_embeddings().embed_documents
+    # Use the centralized get_embeddings from app.llm
+    embedding_fn = get_embeddings().embed_documents # <--- MODIFIED LINE
     texts = [d.page_content for d in split_docs]
     vectors = embedding_fn(texts)
 
@@ -60,12 +66,5 @@ def ingest_file_to_weaviate(file_path: str) -> int:
                 vector=vector
             )
 
-    print(f"[INGEST] ✅ Ingested {len(split_docs)} chunks")
+    print(f"[INGEST] ✅ Ingested {len(split_docs)} chunks to Weaviate.")
     return len(split_docs)
-
-
-def ingest_files(paths: List[str]) -> int:
-    total = 0
-    for path in paths:
-        total += ingest_file_to_weaviate(path)
-    return total

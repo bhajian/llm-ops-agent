@@ -1,161 +1,191 @@
 # app/agent_router.py
-
+# ────────────────────────────────────────────────────────────
 """
-Central router that decides which tool answers a user question.
-
-Order of precedence
-────────────────────
-1.  Hard-coded heuristics  (regexes → Finance / K8s)
-2.  Fast LLM classifier    (K8S | FMP | COT_RAG | CHAT)
+LLM-based router — backend-agnostic (OpenAI, vLLM, llama.cpp, …).
+It looks at **both** recent memory and the current question and picks one of:
+CHAT – generic conversation via chat_with_memory
+FINANCE – calls FMP agent
+COT_RAG – CoT reasoning + retrieval from documents
 """
 
 from __future__ import annotations
 
-import asyncio, json, re
-from functools import lru_cache
-from typing import Dict, List, Literal
+import asyncio, os, importlib, warnings
+import json
+import re # Import regex module
 
-from langchain.prompts import ChatPromptTemplate
-from langchain_core.messages import AIMessage
+from enum import Enum
+from typing import Callable, Dict, List
+
+from langchain.schema import SystemMessage, HumanMessage, AIMessage
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from app.llm import get_llm
-from app.fmp_agent import get_fmp_agent
-from app.k8s_agent import get_k8s_agent
-from app.rag_agent import get_cot_rag_chain, run_parallel_searches
-from app.memory import save_chat, format_chat_history
+from app.chat_memory import chat_with_memory
+# UPDATED IMPORT: Agent modules are now in app/agents/
+from app.agents.fmp_agent import get_fmp_agent
 
-# ───────── Finance heuristics ─────────
-_FIN_KEYWORDS = re.compile(
-    r"\b(price|quote|p/e|eps|dividend|yield|fundamental|roe|market cap|"
-    r"fluctuation|performance|last \d+ (day|week|month|year)s?)\b",
-    re.I,
-)
-
-def _extract_symbol(text: str) -> str | None:
-    words = re.findall(r"\b[A-Z]{2,5}\b", text.strip()[1:])
-    return words[0] if words else None
-
-def _looks_like_finance(q: str) -> bool:
-    return _FIN_KEYWORDS.search(q) is not None or _extract_symbol(q) is not None
-
-# ───────── K8s heuristics ─────────
-_K8S_KEYWORDS = re.compile(
-    r"\b(scale|restart|pod|deployment|namespace|cpu usage|replica)\b",
-    re.I,
-)
-
-def _looks_like_k8s(q: str) -> bool:
-    return _K8S_KEYWORDS.search(q) is not None
-
-# ───────── Classifier ─────────
-@lru_cache(512)
-def _classifier(q: str) -> Literal["K8S", "FMP", "COT_RAG", "CHAT"]:
+# ─── dynamically load RAG helper ────────────────────────────
+def _first_callable(module: str, *fn_names: str):
     try:
-        prompt = (
-            "You are a router. Return exactly one token from this list:\n"
-            "K8S, FMP, COT_RAG, CHAT\n\n"
-            f"Question: {q}\nAnswer:"
-        )
-        return get_llm().predict(prompt).strip().upper()
-    except Exception as e:
-        print(f"⚠️ LLM classifier failed: {e}")
-        return "COT_RAG"
+        mod = importlib.import_module(module)
+    except ModuleNotFoundError:
+        return None
+    for fn in fn_names:
+        obj = getattr(mod, fn, None)
+        if callable(obj):
+            return obj
+    return None
 
-# ───────── Planner (CoT) ─────────
-_PLAN_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a step-by-step planner for a multi-hop RAG system. "
-     "Break the question into independent retrieval steps followed by reasoning.\n\n"
-     "Return ONLY JSON.\n\n"
-     "Format:\n"
-     '{\n'
-     '  "steps": [\n'
-     '    {"type": "SEARCH", "query": "<semantic search query>"},\n'
-     '    {"type": "SEARCH", "query": "<another search if needed>"},\n'
-     '    {"type": "COMPUTE", "instruction": "<how to reason over retrieved results>"}\n'
-     '  ]\n'
-     '}\n\n'
-     "Be strict: never include natural language outside the JSON."),
-    ("user", "{question}"),
+# UPDATED: The module string for dynamic import now points to the new location
+get_rag_chain_from_module = _first_callable("app.agents.rag_agent", "get_rag_chain")
+
+
+# ─── intent labels and Enum for routing output ──────────
+class Intent(str, Enum):
+    CHAT = "CHAT"
+    FINANCE = "FINANCE"
+    COT_RAG = "COT_RAG" # CoT = Chain of Thought (for RAG)
+
+
+_router_llm = get_llm(temperature=0)
+_router_string_parser = StrOutputParser()
+
+
+# Simplified prompt for the LLM router, as it's now a fallback
+_ROUTER_PROMPT = ChatPromptTemplate.from_messages([
+    SystemMessage(content=(
+        "You are an expert at classifying user intent. "
+        "Your task is to determine if the user's query is purely conversational ('CHAT'). "
+        "Only output 'CHAT' if no other specific intent is obvious from the query or history. "
+        "DO NOT output 'FINANCE' or 'COT_RAG'. Those will be handled by specific rules."
+        "You MUST output **ONLY** the keyword 'CHAT' (no other text, no punctuation, no explanations, no special tokens)."
+    )),
+    MessagesPlaceholder(variable_name="chat_history"),
+    HumanMessage(content="{input}"),
 ])
-_PLANNER_LLM = get_llm(streaming=False)
 
-# ───────── Public API ─────────
-async def route_query(q: str, history: List[Dict], chat_id: str = "default") -> str:
-    if _looks_like_finance(q):
-        return await asyncio.to_thread(get_fmp_agent().run, q)
 
-    if _looks_like_k8s(q):
-        return await asyncio.to_thread(get_k8s_agent().run, q)
+def _choose_intent(user_msg: str, chat_history: List[dict]) -> Intent:
+    normalized_user_msg = user_msg.lower().strip()
 
-    tool = determine_route(q)
-    print(f"🧭 Routing decision: {tool}")
+    # --- Rule-Based Routing (Prioritized) ---
+    # Rule 1: RAG queries (e.g., "who is X", "tell me about Y", if it's a person/concept likely in docs)
+    # The 'rastgoo.pdf' contains "Milo Rastgoo"
+    if "who is" in normalized_user_msg or \
+       "tell me about" in normalized_user_msg or \
+       "information about" in normalized_user_msg or \
+       "summarize" in normalized_user_msg: # Added 'summarize' for RAG
+        # Check if the query contains names or terms likely found in ingested documents
+        # This is a heuristic and might need refinement based on your document types
+        if "behnam hajian" in normalized_user_msg or \
+           "milo rastgoo" in normalized_user_msg or \
+           "project" in normalized_user_msg or \
+           "report" in normalized_user_msg or \
+           "document" in normalized_user_msg or \
+           "company" in normalized_user_msg:
+            print(f"🧭 Rule-based router chose: COT_RAG for query: '{user_msg}'")
+            return Intent.COT_RAG
 
-    if tool == "FMP":
-        return await asyncio.to_thread(get_fmp_agent().run, q)
-
-    if tool == "K8S":
-        return await asyncio.to_thread(get_k8s_agent().run, q)
-
-    context = format_chat_history(history)
-
-    if tool == "CHAT":
-        prompt = f"{context}\nUser: {q}\nAssistant:" if context else f"User: {q}\nAssistant:"
-        return await asyncio.to_thread(get_llm().predict, prompt)
-
-    # ───── COT-RAG starts here ─────
-    rag_chain = get_cot_rag_chain()
-    raw_plan = "[uninitialized]"
-
+    # Rule 2: Finance queries (explicit financial terms, stock, price, company name in financial context, date/time)
+    finance_keywords = ["stock", "price", "company value", "market cap", "earnings", "dividend", "financials", "analyst", "target"]
+    if any(keyword in normalized_user_msg for keyword in finance_keywords) or \
+       "date today" in normalized_user_msg or "current time" in normalized_user_msg or \
+       "what time is it" in normalized_user_msg or "what date is it" in normalized_user_msg:
+        print(f"🧭 Rule-based router chose: FINANCE for query: '{user_msg}'")
+        return Intent.FINANCE
+    
+    # --- Fallback to LLM Router for General CHAT ---
+    # If no rule matches, let the LLM decide if it's general CHAT.
+    # We explicitly tell the LLM to ONLY output 'CHAT'.
+    messages_for_router = _ROUTER_PROMPT.format_messages(
+        input=user_msg,
+        chat_history=_convert_history_to_messages(chat_history)
+    )
+    llm_response = None
+    raw_content = "N/A" 
     try:
-        plan_response = _PLANNER_LLM.invoke(_PLAN_PROMPT.format(question=q))
-        raw_plan = plan_response.content if isinstance(plan_response, AIMessage) else str(plan_response)
-        raw_plan = re.sub(r"^```(json)?|```$", "", raw_plan.strip(), flags=re.MULTILINE)
-        plan = json.loads(raw_plan)
+        llm_response = _router_llm.invoke(messages_for_router)
+        
+        if hasattr(llm_response, 'content'):
+            raw_content = llm_response.content.strip()
+        else:
+            raw_content = str(llm_response).strip()
 
-        search_queries = [
-            s["query"] for s in plan.get("steps", [])
-            if s.get("type") == "SEARCH"
-        ]
+        # Simple cleaning and parsing for the expected 'CHAT' keyword
+        cleaned_keyword = raw_content.split()[0].upper() if raw_content else ""
+
+        if cleaned_keyword == "CHAT":
+            print(f"🧭 LLM router chose: CHAT (from raw response: '{raw_content}') for query: '{user_msg}'")
+            return Intent.CHAT
+        else:
+            warnings.warn(
+                f"LLM router produced unexpected keyword: '{cleaned_keyword}'. Raw response: '{raw_content}'. "
+                "Falling back to CHAT."
+            )
+            return Intent.CHAT
     except Exception as e:
-        print(f"⚠️ Planner failed: {e}\n🧾 Raw:\n{raw_plan}")
+        warnings.warn(f"Router LLM (fallback) failed: {e}. Raw response: '{raw_content}'. Falling back to CHAT.")
+        return Intent.CHAT
 
-        formatted = format_chat_history(history)
-        fallback_prompt = f"{formatted}\nUser: {q}" if formatted else q
-        result = await asyncio.to_thread(rag_chain.invoke, {"query": fallback_prompt})
-        answer = result["result"]
-        save_chat(chat_id, q, answer, scratch=None)
-        return answer
+# ─── public API (used by main.py) ───────────────────────────
+async def route_query(user_msg: str,
+                      history: List[dict],
+                      chat_id: str) -> str:
+    """
+    Routes the user's query to the appropriate agent based on LLM decision.
+    """
+    # 1. Choose intent via Rule-based or LLM-based router
+    intent = _choose_intent(user_msg, history)
 
-    docs = await run_parallel_searches(search_queries, rag_chain.retriever)
-
-    scratch = (
-        f"# Chat History\n{context}\n\n"
-        f"# Plan\n```json\n{json.dumps(plan, indent=2)}\n```\n"
-        f"# Retrieved\n" +
-        "\n".join(d.page_content[:600] for d in docs)
-    )
-
-    answer_prompt = (
-        "Use the plan, history, and retrieved docs to answer. "
-        "Be concise and cite like (Doc 1).\n\n"
-        f"{scratch}\n\nAnswer:"
-    )
-
-    answer = await asyncio.to_thread(rag_chain.llm.predict, answer_prompt)
-    save_chat(chat_id, q, answer, scratch)
+    # 2. Call appropriate agent based on intent
+    answer = ""
+    if intent == Intent.CHAT:
+        answer = chat_with_memory(user_msg, history)
+    elif intent == Intent.FINANCE:
+        try:
+            fmp_agent = get_fmp_agent()
+            # Pass streaming=True for async operations
+            if hasattr(fmp_agent, "ainvoke"):
+                result = await fmp_agent.ainvoke({"input": user_msg, "chat_history": _convert_history_to_messages(history)}, config={"callbacks": [], "tags": ["fmp_agent"], "max_retries": 1})
+            else:
+                result = await asyncio.to_thread(fmp_agent.invoke, {"input": user_msg, "chat_history": _convert_history_to_messages(history)})
+            answer = result.get("output", "Could not get an answer from the FMP agent.")
+        except Exception as e:
+            warnings.warn(f"FMP Agent failed during ainvoke: {e}")
+            answer = "I'm sorry, I encountered an error while trying to get financial data."
+    elif intent == Intent.COT_RAG:
+        if get_rag_chain_from_module:
+            try:
+                # FIX: Pass streaming=True to get_rag_chain_from_module
+                rag_chain = get_rag_chain_from_module(streaming=True) 
+                if hasattr(rag_chain, "ainvoke"):
+                    result = await rag_chain.ainvoke({"input": user_msg, "chat_history": _convert_history_to_messages(history)}, config={"callbacks": [], "tags": ["rag_agent"], "max_retries": 1})
+                else:
+                    result = await asyncio.to_thread(rag_chain.invoke, {"input": user_msg, "chat_history": _convert_history_to_messages(history)})
+                answer = result.get("answer", "I could not find relevant information in the documents.")
+            except Exception as e:
+                warnings.warn(f"RAG Agent failed during ainvoke: {e}")
+                answer = "I'm sorry, I encountered an error while trying to retrieve information from documents."
+        else:
+            warnings.warn("RAG agent module 'app.agents.rag_agent' or 'get_rag_chain' not found. Falling back to CHAT.")
+            answer = chat_with_memory(user_msg, history) 
+    else:
+        answer = chat_with_memory(user_msg, history)
+        warnings.warn(f"Unhandled intent: {intent}. Falling back to CHAT.")
+    
     return answer
 
-def determine_route(question: str) -> str:
-    if _looks_like_finance(question):
-        return "FMP"
-    if _looks_like_k8s(question):
-        return "K8S"
-
-    raw = _classifier(question)
-    print(f"🧪 Raw classifier result: {raw}")
-
-    if raw in {"CHAT", "COT_RAG"}:
-        return "COT_RAG"
-
-    return raw
+# ───────────────── helpers ───────────────────────────────────────────────
+def _convert_history_to_messages(history: List[dict]) -> List[AIMessage | HumanMessage]:
+    """Converts the raw history dicts to LangChain message objects."""
+    converted_messages = []
+    for entry in history:
+        if entry["role"] == "user":
+            converted_messages.append(HumanMessage(content=entry["content"]))
+        elif entry["role"] == "assistant":
+            # For assistant messages, ensure we only take content, not scratch
+            converted_messages.append(AIMessage(content=entry["content"]))
+    return converted_messages

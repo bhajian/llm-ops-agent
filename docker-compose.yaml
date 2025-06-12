@@ -1,8 +1,7 @@
-
-
+# ────────────── Named volumes (persistent) ──────────────
 volumes:
-  redis-data:
-  weaviate-data:
+  redis-data: 
+  weaviate-data: 
 
 services:
 # ────────────── DATA LAYER ──────────────
@@ -12,85 +11,106 @@ services:
     volumes:
       - ./data/redis:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    ports: ["6379:6379"]        # ← host-level access (optional)
+    expose: ["6379"]            # internal network (redundant if ports above)
 
   weaviate:
     image: semitechnologies/weaviate:1.24.8
-    ports: ["8080:8080"]
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
-
       DEFAULT_VECTORIZER_MODULE: text2vec-openai
       ENABLE_MODULES: text2vec-openai,text2vec-huggingface
       OPENAI_APIKEY: ${OPENAI_API_KEY:-}
     volumes:
       - ./data/weaviate:/var/lib/weaviate
     restart: unless-stopped
-    depends_on: [redis]
+    depends_on:
+      redis:
+        condition: service_healthy
+    expose: ["8080"]             # internal use
+    ports: ["8080:8080"]         # reach Weaviate from host if needed
 
-# ────────────── MCP FAÇADES ──────────────
+# ────────────── MCP SERVERS ──────────────
   mcp-openshift:
     build: ./mcp-openshift
     environment:
       MCP_USERNAME: ${MCP_USERNAME:-admin}
       MCP_PASSWORD: ${MCP_PASSWORD:-secret}
       KUBECONFIG: /app/.kube/config
-    ports: ["9000:9000"]
+      PORT: 9000
+    expose: ["9000"]             # only agent needs this
+    ports: ["9101:9000"]         # expose to host (optional)
     restart: unless-stopped
 
   mcp-fmp:
     build: ./mcp-fmp
     environment:
-      MCP_USERNAME: ${MCP_USERNAME:-admin}
-      MCP_PASSWORD: ${MCP_PASSWORD:-secret}
-      FMP_API_KEY:  ${FMP_API_KEY}
-    ports: ["9100:9000"]
+      PORT: 5000
+      FMP_API_KEY: ${FMP_API_KEY}
+    expose: ["5000"]             # agent uses this internally
+    ports:
+      - "${HOST_PORT:-9100}:5000"  # host access → localhost:9100
     restart: unless-stopped
 
 # ────────────── AGENT (FastAPI + RAG) ──────────────
   agent-server:
     build: .
-    ports: ["8000:8000"]
     environment:
-      LLM_BACKEND:  ${LLM_BACKEND:-openai}
-      LLM_BASE_URL: ${LLM_BASE_URL:-}
-      LLM_MODEL:    ${LLM_MODEL}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-
-      REDIS_HOST:   redis
-      WEAVIATE_URL: http://weaviate:8080
-      MCP_FMP_URL:  http://mcp-fmp:9000
-      MCP_K8S_URL:  http://mcp-openshift:9000
-      MCP_USERNAME: ${MCP_USERNAME:-admin}
-      MCP_PASSWORD: ${MCP_PASSWORD:-secret}
-      ADMIN_TOKEN:  ${ADMIN_TOKEN:-supersecrettoken}
+      - LANGCHAIN_TRACING_V2=true
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
+      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - BEDROCK_REGION=${BEDROCK_REGION}
+      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND} # CORRECTED LINE
+      # - HUGGINGFACE_HUB_TOKEN: ${HUGGINGFACE_HUB_TOKEN:-admin}
+      - LLM_BACKEND=${LLM_BACKEND:-bedrock} # CORRECTED FOR CONSISTENCY
+      - LLM_BASE_URL=${LLM_BASE_URL:-} # CORRECTED FOR CONSISTENCY
+      - LLM_MODEL=${LLM_MODEL} # CORRECTED FOR CONSISTENCY
+      # - EMBEDDING_MODEL=${EMBEDDING_MODEL} # CORRECTED FOR CONSISTENCY
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-} # CORRECTED FOR CONSISTENCY
+      - BEDROCK_EMBED_MODEL=${BEDROCK_EMBED_MODEL}
+      - REDIS_HOST=redis # CORRECTED FOR CONSISTENCY
+      - WEAVIATE_URL=http://weaviate:8080 # CORRECTED FOR CONSISTENCY
+      - FMP_FASTAPI_URL=http://mcp-fmp:5000 # CORRECTED FOR CONSISTENCY
+      - MCP_K8S_URL=http://mcp-openshift:9000 # CORRECTED FOR CONSISTENCY
+      - MCP_USERNAME=${MCP_USERNAME:-admin} # CORRECTED FOR CONSISTENCY
+      - MCP_PASSWORD=${MCP_PASSWORD:-secret} # CORRECTED FOR CONSISTENCY
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-supersecrettoken} # CORRECTED FOR CONSISTENCY
 
     volumes:
       - ./:/app
     command: >
       uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     restart: unless-stopped
-    depends_on: [redis, weaviate, mcp-openshift, mcp-fmp]
+    depends_on:
+      weaviate:
+        condition: service_started
+      mcp-openshift:
+        condition: service_started
+      mcp-fmp:
+        condition: service_started
+    expose: ["8000"]             # internal (ui)
+    ports: ["8000:8000"]         # host access for API
 
 # ────────────── SIMPLE STREAMLIT UI ──────────────
   ui:
     build: ./ui
-    ports: ["8501:8501"]
     environment:
       BACKEND_URL: http://agent-server:8000
       AUTH_TOKEN:  ${ADMIN_TOKEN:-supersecrettoken}
-      STREAMLIT_SERVER_RUNONSAVE: true
+      STREAMLIT_SERVER_RUNONSAVE: "true"
     volumes:
       - ./ui:/app
-    depends_on: [agent-server]
-
-# ────────────── OPTIONAL: LOCAL vLLM SERVER ──────────────
-#  vllm:
-#    image: vllm/vllm-openai:latest
-#    command: python -m vllm.entrypoints.openai.api_server \
-#             --model /models/llama-3-8b-instruct.Q4_K_M.gguf \
-#             --served-model-name llama-3-8b-instruct
-#    volumes:
-#      - /path/to/gguf:/models
-#    ports: ["8000:8000"]
+    depends_on:
+      agent-server:
+        condition: service_started
+    ports: ["8501:8501"]         # expose UI to host
+    
