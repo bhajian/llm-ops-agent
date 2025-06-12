@@ -1,15 +1,16 @@
-# app/chat_memory.py
+# app/chat_agent.py
 # ────────────────────────────────────────────────────────────
 """
-Minimal helper that feeds the last N turns plus the new question to whatever
-LLM backend `get_llm()` returns. Compatible with vLLM / Llama / OpenAI.
+Handles general conversational queries for the chat agent.
+Feeds the last N turns plus the new question to the LLM.
 """
 
-from typing import List
+from typing import List, Dict
 
-from langchain.schema import HumanMessage, AIMessage, SystemMessage # Import SystemMessage
-from app.llm    import get_llm            # central factory (vllm, llama, etc.)
-from app.memory import format_chat_history
+from langchain.schema import HumanMessage, AIMessage, SystemMessage
+# Local imports from common directory
+from app.llm import get_llm
+from app.memory import format_chat_history # Keeping this import as it might be used elsewhere, though not directly in chat_with_memory LLM call
 
 WINDOW = 10  # how many back-turns to keep
 
@@ -25,10 +26,11 @@ _CHAT_SYSTEM_MESSAGE = SystemMessage(
         "Keep your responses brief and to the point, focusing solely on the user's immediate query or conversational turn. "
         "Do not offer to explain concepts like LLMs, context windows, or learning types unless explicitly asked."
         "If you do not know the answer to a question, simply state 'I don't know.' Do not guess or make up information."
+        "Do not include any preambles or conversational filler unless it's a direct response to a greeting."
     )
 )
 
-def _dicts_to_messages(history: List[dict]):
+def _dicts_to_messages(history: List[Dict[str, str]]):
     msgs = []
     for m in history[-WINDOW:]:
         role, content = m.get("role"), m.get("content", "")
@@ -41,11 +43,14 @@ def _dicts_to_messages(history: List[dict]):
     return msgs
 
 
-def chat_with_memory(query: str, history: List[dict]) -> str:
-    llm = get_llm()                       # any backend
+def chat_with_memory(query: str, history: List[Dict[str, str]]) -> str:
+    """
+    Handles general chat interactions with memory.
+    """
+    llm = get_llm(streaming=True) # Enable streaming for chat output
     messages = [_CHAT_SYSTEM_MESSAGE] + _dicts_to_messages(history) # Add system message here
     messages.append(HumanMessage(content=query))
 
-    resp = llm.invoke(messages)          # LC ≥0.1 works on list-of-messages
-    # OpenAI / vLLM returns ChatMessage, HFTextGen returns str
+    resp = llm.invoke(messages)
     return resp.content.strip() if hasattr(resp, "content") else str(resp).strip()
+

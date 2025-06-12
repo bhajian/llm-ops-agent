@@ -1,4 +1,8 @@
-# app/tools/datetime_tools.py
+# app/tools/datetime_tool.py
+# ────────────────────────────────────────────────────────────
+"""
+Provides a tool to get the current date and time.
+"""
 from datetime import datetime
 from langchain.tools import StructuredTool
 from pydantic import BaseModel, Field
@@ -12,7 +16,6 @@ def _get_current_datetime() -> str:
     """
     Returns the current date and time in ISO format (YYYY-MM-DD HH:MM:SS).
     """
-    # FIX: Use datetime.now() to get the current date and time dynamically
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 get_current_datetime_tool = StructuredTool.from_function(

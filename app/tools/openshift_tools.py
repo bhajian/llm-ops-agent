@@ -1,3 +1,4 @@
+# app/tools/openshift_tools.py
 import os
 import requests
 
@@ -26,6 +27,6 @@ def get_pods(namespace: str = "default") -> str:
         pods = res.json().get("pods", [])
         if not pods:
             return "No pods found."
-        return f"Pods in '{namespace}':\n- " + "\n- ".join(pods)
+        return f"Pods in '{namespace}':\\n- " + "\\n- ".join(pods)
     except requests.RequestException as e:
         return f"❌ Failed to fetch pods from MCP: {e}"

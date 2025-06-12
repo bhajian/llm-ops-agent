@@ -17,6 +17,7 @@ import os
 import sys
 from pathlib import Path
 from typing import List, Optional, Set
+import re # Import regex module
 
 from .config import get_settings  # ← relative import (project rule)
 
@@ -27,8 +28,18 @@ _VALID_LLM_BACKENDS: Set[str] = {"bedrock", "openai", "vllm", "local", "gemini"}
 _VALID_EMB_BACKENDS: Set[str] = {"bedrock", "openai", "hf", "local", "auto", "gemini"}
 
 def _env_choice(key: str, default: str, valid: Set[str]) -> str:
-    """Lower-case env value and validate against allowed set."""
-    val = (_cfg.get(key) or default).lower()
+    """Lower-case env value, remove comments/whitespace, and validate against allowed set."""
+    val_from_cfg = _cfg.get(key) or default
+    
+    # NEW FIX: Aggressively remove comments and strip whitespace
+    if val_from_cfg is not None:
+        # Remove everything from the first '#' character to the end of the string
+        val_cleaned = re.sub(r'#.*', '', val_from_cfg).strip()
+    else:
+        val_cleaned = default.strip() if default is not None else "" # Fallback for default
+
+    val = val_cleaned.lower() # Convert to lowercase for validation
+
     if val not in valid:
         raise ValueError(f"{key.upper()} must be one of {sorted(valid)} — got '{val}'")
     return val
@@ -111,11 +122,6 @@ def get_llm(
 
         llm_model_kwargs = {"temperature": temp} 
 
-        # FIX: Remove stop_sequences for Llama 3/4 if they are causing issues.
-        # The error "Stop sequence key name for meta is not supported" means
-        # even passing an empty list for this key is problematic for these specific models.
-        # We will no longer conditionally add 'stop_sequences': []
-        
         # Determine if it's a chat-specific model or a general text model
         if _MODEL.startswith("anthropic.claude") or _MODEL.startswith("meta.llama3") or _MODEL.startswith("meta.llama4"):
             # Use ChatBedrock for models that typically follow chat message structure
@@ -192,7 +198,9 @@ def get_embeddings():
             return "gemini"
         return "hf"
 
-    backend = _EMBED_BACKEND if _EMBED_BACKEND != "auto" else _auto_choice()
+    # FIX: Applying .strip() and regex cleaning here as well for EMBED_BACKEND
+    backend_val = (_EMBED_BACKEND if _EMBED_BACKEND != "auto" else _auto_choice())
+    backend = re.sub(r'#.*', '', backend_val).strip().lower() # Apply regex cleaning before lower()
 
     # ---------- OpenAI embeddings ---------------------------------
     if backend == "openai":

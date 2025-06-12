@@ -2,35 +2,23 @@
 # ─────────────────────────────────────────────────────────────
 import os, tempfile, asyncio
 from pathlib import Path
-from typing import AsyncIterator, List
+from typing import AsyncIterator, List, Dict, Any
 
 from fastapi import FastAPI, Depends, Request, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from langchain.callbacks.base import AsyncCallbackHandler
+from starlette.concurrency import iterate_in_threadpool # Needed for async generator in StreamingResponse
 
-# --- IMPORTS ---
+# --- IMPORTS ---\
 from app.auth import verify_token
 from app.memory import load_chat, save_chat, _r
-from app.agent_router import route_query # <--- THIS IS THE ONLY ROUTER IMPORT NOW
+# FIX: Import the LangGraph app
+from app.graph_orchestrator import app as langgraph_app, GraphState # Import the compiled graph and its state type
 from app.tools.vector_utils import ingest_file_to_weaviate # For ingest endpoint
 
 app = FastAPI()
 
 # ─────────────────────────────────────────────────────────────
-# Helper to check for initial chat trigger phrases
-def _is_initial_chat_trigger(query: str, chat_id: str) -> bool:
-    """
-    Checks if the query indicates a new chat session and there's no existing history.
-    """
-    normalized_query = query.lower().strip()
-    # Check for empty query or common greeting phrases
-    if not normalized_query or normalized_query in ["start chat", "hello", "hi", "hey", "help"]:
-        # Only consider it an initial trigger if chat history for this ID is empty
-        return not load_chat(chat_id)
-    return False
-
-# ─────────────────────────────────────────────────────────────
-# /chat  (non-stream) - REFACTORED
+# /chat  (non-stream) - kept for compatibility, but streaming is preferred
 # ─────────────────────────────────────────────────────────────
 @app.post("/chat")
 async def chat(req: Request, user: str = Depends(verify_token)):
@@ -38,81 +26,115 @@ async def chat(req: Request, user: str = Depends(verify_token)):
     query = body.get("query", "")
     cid = body.get("chat_id", user)
 
-    print(f"💬 /chat received query: '{query}' for chat_id: '{cid}'")
+    print(f"💬 /chat received query: {query} for chat_id: '{cid}'")
 
-    # 1. Handle initial empty query or specific start phrases with a static welcome message
-    if _is_initial_chat_trigger(query, cid):
-        welcome_message = "Hello! How can I help you today?"
-        print(f"✅ Returning static welcome message for new chat or initial greeting.")
-        return JSONResponse({"response": welcome_message, "chat_id": cid})
-
-    # 2. Load history (only if not an initial empty query handled above)
+    # 1. Load history
     history = load_chat(cid)
 
-    # 3. Delegate EVERYTHING to the agent router.
-    answer = await route_query(query, history, cid) 
+    # 2. Prepare initial state for LangGraph
+    initial_state = GraphState(
+        user_query=query,
+        chat_history=history,
+        intent=None,
+        ticker_symbol=None,
+        finance_tool_output=None,
+        rag_condensed_question=None,
+        rag_context=None,
+        final_answer=None,
+        error_message=None
+    )
 
-    print(f"✅ Router returned answer: {answer}")
+    # 3. Invoke the LangGraph application
+    try:
+        # LangGraph app.invoke returns the final state
+        final_state = await langgraph_app.ainvoke(initial_state)
+        answer = final_state.get("final_answer", "I'm sorry, I couldn't generate a response.")
+        
+        # If there was an error message in the state, prioritize it
+        if final_state.get("error_message"):
+            answer = f"Error: {final_state['error_message']} {answer}"
+
+        print(f"✅ LangGraph returned answer: {answer}")
+
+    except Exception as e:
+        warnings.warn(f"LangGraph execution failed: {e}")
+        answer = "I'm sorry, I encountered an unexpected error while processing your request."
 
     # 4. Save the final answer
-    save_chat(cid, query, answer) 
+    save_chat(cid, query, answer)
 
-    return JSONResponse({"response": answer, "chat_id": cid})
-
-# ─────────────────────────────────────────────────────────────
-# token buffer for streaming mode
-# ─────────────────────────────────────────────────────────────
-class _TokenBuffer(AsyncCallbackHandler):
-    def __init__(self):
-        self._q: asyncio.Queue[str | None] = asyncio.Queue()
-
-    async def on_llm_new_token(self, token, **kwargs):
-        await self._q.put(token)
-
-    async def on_new_token(self, token, **kwargs):
-        await self._q.put(token)
-
-    async def aiter(self) -> AsyncIterator[str]:
-        while True:
-            tok = await self._q.get()
-            if tok is None:
-                break
-            yield tok
+    return JSONResponse({"chat_id": cid, "answer": answer})
 
 # ─────────────────────────────────────────────────────────────
-# /chat/stream (streams all answers that support it) - REFACTORED
+# /chat/stream (NEW STREAMING ENDPOINT)
 # ─────────────────────────────────────────────────────────────
 @app.post("/chat/stream")
 async def chat_stream(req: Request, user: str = Depends(verify_token)):
     body = await req.json()
     query = body.get("query", "")
     cid = body.get("chat_id", user)
-    
-    print(f"💬 /chat/stream received query: '{query}' for chat_id: '{cid}'")
 
-    # 1. Handle initial empty query or specific start phrases with a static welcome message
-    if _is_initial_chat_trigger(query, cid):
-        welcome_message = "Hello! How can I help you today?"
-        async def welcome_stream():
-            yield welcome_message
-        print(f"✅ Returning static welcome message stream for new chat or initial greeting.")
-        return StreamingResponse(welcome_stream(), media_type="text/plain")
+    print(f"⚡️ /chat/stream received query: {query} for chat_id: '{cid}'")
 
+    # 1. Load history
     history = load_chat(cid)
+    accumulated_answer_chunks = [] # To save the full answer after streaming
 
-    answer = await route_query(query, history, cid)
-    save_chat(cid, query, answer)
+    async def generate_stream():
+        # Prepare initial state for LangGraph
+        initial_state = GraphState(
+            user_query=query,
+            chat_history=history,
+            intent=None,
+            ticker_symbol=None,
+            finance_tool_output=None,
+            rag_condensed_question=None,
+            rag_context=None,
+            final_answer=None,
+            error_message=None
+        )
 
-    async def once():
-        yield answer
-    return StreamingResponse(once(), media_type="text/plain")
+        try:
+            # Astream_log yields events for each step and LLM chunk
+            # We are interested in "chunks" from the final synthesis nodes
+            async for event in langgraph_app.astream_log(initial_state):
+                # LangGraph events have a specific structure.
+                # 'ops' contains the state changes. 'chunks' contain streamed content.
+                # We want to identify the final answer generation nodes.
+                if event.get("event") == "on_chat_model_stream":
+                    # Check if the stream event is coming from a 'node' that produces final output
+                    # The `name` in `event["name"]` refers to the node name in the graph
+                    # The `metadata` can give us info about the parent chain/node
+                    
+                    # We need to explicitly check if the chunk is from the final LLM invocation.
+                    # This typically means checking the `path` or `name` in the event metadata.
+                    # The `on_chat_model_stream` events will have `chunk` and `messages`
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk and hasattr(chunk, 'content'):
+                        # This yields the raw string content for streaming
+                        # The client will receive this as plain text.
+                        # For production, you might want to wrap this in JSON or SSE format.
+                        print(f"🚀 Streaming chunk: {chunk.content}")
+                        yield chunk.content
+                        accumulated_answer_chunks.append(chunk.content)
+
+        except Exception as e:
+            warnings.warn(f"LangGraph streaming execution failed: {e}")
+            yield "I'm sorry, I encountered an unexpected error while streaming your request."
+        finally:
+            # After the stream ends, save the full accumulated answer to chat history
+            full_answer = "".join(accumulated_answer_chunks)
+            if full_answer: # Only save if there's an answer
+                save_chat(cid, query, full_answer)
+                print(f"✅ Full streamed answer saved to history for chat_id: '{cid}'")
+
+    # Return as StreamingResponse
+    return StreamingResponse(generate_stream(), media_type="text/plain") # text/plain is common for raw streaming
+
 
 # ─────────────────────────────────────────────────────────────
-# /ingest (PDF / TXT → Weaviate) - (No changes needed)
+# /ingest endpoints - (No changes needed beyond import)
 # ─────────────────────────────────────────────────────────────
-def ingest_files(paths: List[str]) -> int:
-    return sum(ingest_file_to_weaviate(p) for p in paths)
-
 @app.post("/ingest")
 async def ingest(file: UploadFile = File(...), user: str = Depends(verify_token)):
     suffix = os.path.splitext(file.filename)[-1] or ".bin"
@@ -121,7 +143,7 @@ async def ingest(file: UploadFile = File(...), user: str = Depends(verify_token)
         tmp_path = tmp.name
 
     try:
-        n_chunks = ingest_files([tmp_path])
+        n_chunks = ingest_file_to_weaviate([tmp_path])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -144,8 +166,7 @@ async def list_chat_ids(user: str = Depends(verify_token)):
     return {"chat_ids": sorted(k.split(":")[1] for k in keys)}
 
 @app.delete("/history/{chat_id}")
-async def delete_history(chat_id: str, user: str = Depends(verify_token)):
-    deleted = _r.delete(f"chat:{chat_id}")
-    if deleted:
-        return {"message": f"Deleted chat history for '{chat_id}'."}
-    return {"message": f"No history found for '{chat_id}'."}
+async def delete_chat_history(chat_id: str, user: str = Depends(verify_token)):
+    _r.delete(f"chat:{chat_id}")
+    return {"message": f"Chat history '{chat_id}' deleted."}
+

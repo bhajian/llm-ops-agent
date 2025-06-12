@@ -15,8 +15,11 @@ from typing import Dict, Any
 
 
 def _env(key: str, default: str | None = None) -> str | None:
-    """Tiny helper for env reads (keeps typing happy)."""
-    return os.getenv(key, default)
+    """
+    Tiny helper for env reads (keeps typing happy).
+    Added .strip() for robustness against leading/trailing whitespace/comments.
+    """
+    return os.getenv(key, default).strip() if os.getenv(key, default) is not None else None
 
 
 @lru_cache
@@ -40,15 +43,17 @@ def get_settings() -> dict:
         # openai    → uses OpenAI cloud
         # vllm      → self-hosted OAI-compatible
         # llama     → local llama.cpp / LM Studio
-        "llm_backend":   _env("LLM_BACKEND", "openai").lower(),
+        "llm_backend":   _env("LLM_BACKEND", "openai").lower(), # .lower() will be applied after .strip()
         "llm_base_url":  _env("LLM_BASE_URL", ""),               # e.g. http://vllm:8000/v1
         "llm_model":     _env("LLM_MODEL", "gpt-4o-mini"),
 
-        # ─── Data Layer ─────────────────────────────────────
-        "redis_host": _env("REDIS_HOST", "redis"),
-        "redis_port": int(_env("REDIS_PORT", "6379")),
-        "redis_db": int(_env("REDIS_DB", "0")),
-        "redis_ttl": int(_env("REDIS_TTL", str(60 * 60 * 24 * 7))),
+        # ─── Data Layer (duplicated section, keeping for user's context) ─────────────────────────────────────
+        # Note: These keys (redis_host, redis_port, redis_db, redis_ttl) are duplicated.
+        # This section should ideally be merged with the first "Data Layer" section for cleaner config.
+        "redis_host": _env("REDIS_HOST", "redis"), # Duplicated, but kept as per your snippet
+        "redis_port": int(_env("REDIS_PORT", "6379") or "6379"), # Added 'or "6379"' to handle None after strip
+        "redis_db": int(_env("REDIS_DB", "0") or "0"), # Added 'or "0"' to handle None after strip
+        "redis_ttl": int(_env("REDIS_TTL", str(60 * 60 * 24 * 7)) or str(60 * 60 * 24 * 7)), # Added 'or str(...)'
 
         # ─── Embeddings ────────────────────────────────────
         # Used when backend is not OpenAI or overridden (e.g., for HuggingFace local/hub)
