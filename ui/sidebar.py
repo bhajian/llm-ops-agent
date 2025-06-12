@@ -1,64 +1,79 @@
-import uuid
+"""
+ui/sidebar.py
+─────────────
+Sidebar widget: list, select, delete conversations.
+"""
+
 import streamlit as st
-from client import list_chats, delete_chat, load_history, init_chat
+import uuid
 
-def render_chat_sidebar():
-    st.header("💬 Chat Sessions")
+import client
 
-    # Initialize chat session list
-    if "session_chats" not in st.session_state:
-        st.session_state.session_chats = set(list_chats())
 
-    # ➕ New Chat button
-    if st.button("➕ New Chat"):
-        new_id = str(uuid.uuid4())
-        init_chat(new_id, "Start chat")
-        st.session_state.session_chats.add(new_id)
-        st.session_state.chat_id = new_id
-        st.session_state[f"messages_{new_id}"] = load_history(new_id)
-        st.rerun()
+def render_chat_sidebar() -> None:
+    st.sidebar.title("💬 Chats")
 
-    st.markdown("---")
+    def _refresh():
+        st.session_state.chats = client.list_history()
+        # Ensure that if there are no chats, a new one is created.
+        if not st.session_state.chats:
+            st.session_state.chat_id = uuid.uuid4().hex
+            st.session_state.chats = [st.session_state.chat_id] # Initialize with the new chat ID
+        elif "chat_id" not in st.session_state or st.session_state.chat_id not in st.session_state.chats:
+            # If chat_id is not set or not in existing chats, default to the first one.
+            st.session_state.chat_id = st.session_state.chats[0]
 
-    # Current chat ID
-    chat_id = st.session_state.get("chat_id")
-    if not chat_id:
-        chat_id = str(uuid.uuid4())
-        init_chat(chat_id, "Start chat")
-        st.session_state.chat_id = chat_id
-        st.session_state.session_chats.add(chat_id)
-        st.session_state[f"messages_{chat_id}"] = load_history(chat_id)
 
-    # Combine Redis and local session IDs (filtering None)
-    redis_chats = list_chats()
-    known_chats = sorted(set(filter(None, redis_chats + list(st.session_state.session_chats))))
+    if "chats" not in st.session_state:
+        _refresh()
+    # Ensure chat_id is set even on initial load if not already.
+    if "chat_id" not in st.session_state:
+        _refresh() # This will ensure chat_id is set if it's missing on initial load
 
-    # Render chat list
-    for cid in known_chats:
-        is_active = cid == chat_id
-        label = f"🟢 {cid[:8]}" if is_active else f"⚪️ {cid[:8]}"
-        col1, col2 = st.columns([0.75, 0.25])
 
-        with col1:
-            if st.button(label, key=f"switch-{cid}"):
-                st.session_state.chat_id = cid
-                if f"messages_{cid}" not in st.session_state:
-                    st.session_state[f"messages_{cid}"] = load_history(cid)
-                st.rerun()
+    # Determine the initial index for the radio button
+    try:
+        initial_index = st.session_state.chats.index(st.session_state.chat_id)
+    except ValueError:
+        # This can happen if st.session_state.chat_id is not in the list of chats
+        # (e.g., after a delete). In this case, default to the first chat if available,
+        # or re-initialize.
+        if st.session_state.chats:
+            initial_index = 0
+            st.session_state.chat_id = st.session_state.chats[0]
+        else:
+            # This case should ideally be handled by _refresh(), but as a fallback
+            _refresh() # Re-call to ensure a chat_id is generated and chats list is updated
+            initial_index = 0 # Default to the newly created chat
+            
+    sel = st.sidebar.radio(
+        "Conversations",
+        st.session_state.chats,
+        index=initial_index,
+        key="conversation_selector" # Add a unique key to prevent warning
+    )
+    st.session_state.chat_id = sel
 
-        with col2:
-            if st.button("🗑", key=f"delete-{cid}"):
-                delete_chat(cid)
-                st.session_state.session_chats.discard(cid)
+    if st.sidebar.button("➕ New Chat"):
+        st.session_state.chat_id = uuid.uuid4().hex
+        st.session_state.chats.insert(0, st.session_state.chat_id) # Add new chat to the top
+        st.session_state.messages = {} # Clear messages for the new chat
+        st.rerun() # Rerun to update the UI with the new chat
 
-                if cid == chat_id:
-                    # Auto-switch to a new chat
-                    new_id = str(uuid.uuid4())
-                    init_chat(new_id, "Start chat")
-                    st.session_state.chat_id = new_id
-                    st.session_state.session_chats.add(new_id)
-                    st.session_state[f"messages_{new_id}"] = load_history(new_id)
-                st.rerun()
-
-    st.markdown("---")
-    st.selectbox("🧠 Model", ["openai-gpt-4o", "openai-gpt-4o-mini"], key="model")
+    if st.sidebar.button("🗑️ Delete Current Chat"):
+        client.delete_history(st.session_state.chat_id)
+        # Remove the deleted chat from the session state list
+        if st.session_state.chat_id in st.session_state.chats:
+            st.session_state.chats.remove(st.session_state.chat_id)
+        
+        # If there are still chats, select the first one, otherwise create a new one
+        if st.session_state.chats:
+            st.session_state.chat_id = st.session_state.chats[0]
+        else:
+            st.session_state.chat_id = uuid.uuid4().hex
+            st.session_state.chats = [st.session_state.chat_id] # Ensure chats list is not empty
+        
+        st.session_state.messages = {} # Clear messages for the (newly selected/created) chat
+        _refresh() # Refresh the list from the server
+        st.rerun() # Rerun to update the UI with the new chat
+        

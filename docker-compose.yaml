@@ -1,5 +1,3 @@
-version: "3.9"
-
 ################################################################################
 #                       PERSISTENT VOLUMES
 ################################################################################
@@ -44,7 +42,7 @@ services:
 #                           MCP SERVERS
 ################################################################################
   mcp-openshift:
-    build: ./app/mcp-openshift
+    build: ./mcp-openshift
     environment:
       MCP_USERNAME: ${MCP_USERNAME:-admin}
       MCP_PASSWORD: ${MCP_PASSWORD:-secret}
@@ -54,7 +52,7 @@ services:
     restart: unless-stopped
 
   mcp-fmp:
-    build: ./app/mcp-fmp
+    build: ./mcp-fmp
     environment:
       PORT: 5000
       FMP_API_KEY: ${FMP_API_KEY}
@@ -94,13 +92,13 @@ services:
 #                           STREAMLIT UI
 ################################################################################
   ui:
-    build: ./app/ui
+    build: ./ui
     environment:
       BACKEND_URL: http://agent-server:8000
       AUTH_TOKEN: ${ADMIN_TOKEN:-supersecrettoken}
       STREAMLIT_SERVER_RUNONSAVE: "true"
     volumes:
-      - ./app/ui:/app
+      - ./ui:/app
     depends_on:
       agent-server:
         condition: service_started

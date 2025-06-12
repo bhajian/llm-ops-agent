@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     embedding_backend: str = Field("auto")  # bedrock | openai | hf | local | auto
     embedding_model: str = Field("")
     local_embedding_path: Optional[str] = None
+    huggingface_api_token: Optional[str] = None # <-- ADD THIS LINE
 
     # External services
     mcp_base_url: Optional[str] = None
@@ -51,18 +52,24 @@ class Settings(BaseSettings):
     langsmith_api_key: Optional[str] = None
     langsmith_project: Optional[str] = None
 
-    @validator("llm_backend", "embedding_backend")
-    def _lower(cls, v: str) -> str:  # noqa: N805
-        return v.lower()
+    @validator("llm_backend", pre=True)
+    def _validate_llm_backend(cls, v: str) -> str:
+        v = v.lower()
+        if v not in {"openai", "bedrock", "vllm", "local"}:
+            raise ValueError(f"LLM_BACKEND must be one of openai | bedrock | vllm | local (got {v})")
+        return v
 
-    model_config = {
-        "env_file": ".env",
-        "env_file_encoding": "utf-8",
-        "case_sensitive": False,
-    }
+    @validator("embedding_backend", pre=True)
+    def _validate_embedding_backend(cls, v: str) -> str:
+        v = v.lower()
+        if v not in {"bedrock", "openai", "hf", "local", "auto"}:
+            raise ValueError(f"EMBEDDING_BACKEND must be one of bedrock | openai | hf | local | auto (got {v})")
+        return v
 
 
-@lru_cache
+@lru_cache()
 def get_settings() -> Settings:
-    """Return cached Settings instance (singleton)."""
+    """
+    Return cached Settings object.
+    """
     return Settings()

@@ -26,6 +26,9 @@ def run(
     context = blackboard.read_all(conversation_id)
     summary = mem_tool.run(conversation_id)
 
+    print(f"DEBUG: ReasonerAgent context: {context}") # ADDED
+    print(f"DEBUG: ReasonerAgent summary: {summary}") # ADDED
+
     prompt = (
         "You are ReasonerAgent.\n"
         "Context provided by other agents (JSON):\n"
@@ -42,4 +45,6 @@ def run(
                 yield chunk.content
     else:
         resp = llm.invoke(prompt)
+        print(f"DEBUG: ReasonerAgent final response: {resp.content}") # ADDED
         return resp.content
+    

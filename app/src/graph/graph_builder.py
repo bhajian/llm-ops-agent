@@ -42,17 +42,12 @@ def _run_task(task_id: str, user_q: str, convo_id: str, stream: bool):
         "retrieval": retrieval_agent,
         "finance": finance_agent,
         "k8s": k8s_agent,
-    }.get(task_id)
-    if fn is None:
-        return []
+    }
+    print(f"DEBUG: Running task: {task_id} with stream={stream}") # ADDED
+    return fn[task_id].run(user_q, convo_id, stream=stream)
 
-    return (
-        fn(user_q, convo_id, stream=True)
-        if stream
-        else (fn(user_q, convo_id, stream=False) or [])
-    )
 
-# ─────────────────── orchestrator ───────────────────
+# ─────────────────── main entry ───────────────────
 def handle_chat(
     user_query: str,
     conversation_id: str,
@@ -61,6 +56,7 @@ def handle_chat(
 ) -> str | Iterator[str]:
     # 1 — Planner
     tasks = planner_agent(user_query, conversation_id)
+    print(f"DEBUG: PlannerAgent returned tasks: {tasks}") # ADDED
 
     # 2 — Execute tasks
     if stream:
@@ -69,7 +65,7 @@ def handle_chat(
                 if isinstance(chunk, AIMessage):
                     yield chunk.content
         if tasks:
-            yield "\n---\n"
+            yield "---\n" # Corrected from "---" for consistent SSE formatting
     else:
         for tid in tasks:
             _run_task(tid, user_query, conversation_id, False)
@@ -101,5 +97,4 @@ def handle_chat(
     _update_summary(conversation_id, user_query, final_answer)
     blackboard.clear(conversation_id)
 
-    if not stream:
-        return final_answer
+    return final_answer

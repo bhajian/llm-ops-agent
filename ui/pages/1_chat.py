@@ -1,62 +1,49 @@
-# pages/1_chat.py
-
 import streamlit as st
-from client import stream_chat
-from sidebar import render_chat_sidebar  # Ensure sidebar.py exists and works
+from client import stream_chat, get_history # Import get_history
+from sidebar import render_chat_sidebar
 
-st.set_page_config(page_title="LLM DevOps · Chat", page_icon="💬")
+st.set_page_config(page_title="LLM Chat", page_icon="💬")
 
-# ─── Sidebar UI ───────────────────────────────────────────────
+# Sidebar
 with st.sidebar:
     render_chat_sidebar()
 
-# ─── Current chat session ID ──────────────────────────────────
-chat_id = st.session_state.get("chat_id")
-if not chat_id:
-    st.warning("No chat session selected. Please select or create a new chat from the sidebar.")
-    st.stop()
+chat_id = st.session_state.chat_id
+history_key = f"messages_{chat_id}"
 
-# ─── Per-chat session key ─────────────────────────────────────
-key = f"messages_{chat_id}"
+# Load history if not already loaded for the current chat_id
+if history_key not in st.session_state:
+    st.session_state[history_key] = get_history(chat_id) # Load from backend
 
-# ─── Initialize chat history if first time ────────────────────
-if key not in st.session_state:
-    st.session_state[key] = []
 
-# ─── Chat display container ───────────────────────────────────
-chat_box = st.container()
+# Show previous messages
+for msg in st.session_state[history_key]:
+    st.chat_message(msg["role"]).write(msg["content"])
 
-for msg in st.session_state[key]:
-    with chat_box.chat_message(msg["role"]):  # Only accepts "user" or "assistant"
-        st.markdown(msg["content"])
+# Input box
+if user_msg := st.chat_input("Say something…"):
+    # show user message
+    st.chat_message("user").write(user_msg)
+    st.session_state[history_key].append({"role": "user", "content": user_msg})
 
-# ─── Input prompt box ─────────────────────────────────────────
-prompt = st.chat_input("Ask me anything...")
+    # stream assistant response
+    with st.chat_message("assistant"):
+        full_resp = ""
+        placeholder = st.empty()
+        for line in stream_chat(chat_id, user_msg):
+            if line.startswith(b"data: "):
+                chunk = line[6:].decode().strip()
+                if chunk == "[DONE]":
+                    break
+                if chunk.startswith("[ERROR]"): # Handle server-side errors
+                    placeholder.error(chunk)
+                    full_resp = "" # Don't save error as assistant message
+                    break
+                full_resp += chunk
+                placeholder.markdown(full_resp + "▌")
+        placeholder.markdown(full_resp or "_(no response)_")
 
-if prompt:
-    # 1. Display user prompt
-    st.session_state[key].append({"role": "user", "content": prompt})
-    with chat_box.chat_message("user"):
-        st.markdown(prompt)
-
-    # 2. Stream assistant response
-    with chat_box.chat_message("assistant"):
-        full_response = ""
-        response_placeholder = st.empty()
-
-        with st.status(label="Thinking...", expanded=True, state="running") as status:
-            try:
-                for token in stream_chat(prompt, chat_id):
-                    full_response += token
-                    response_placeholder.markdown(full_response + "▌")  # Blinking cursor
-
-                response_placeholder.markdown(full_response)
-                status.update(label="Response generated!", state="complete", expanded=False)
-
-            except Exception as e:
-                full_response = f"❌ Error: {e}"
-                response_placeholder.markdown(full_response)
-                status.update(label="An error occurred!", state="error", expanded=True)
-
-    # 3. Save assistant reply to session
-    st.session_state[key].append({"role": "assistant", "content": full_response})
+    # save assistant reply if not an error
+    if full_resp: # Only save if there was a valid response
+        st.session_state[history_key].append({"role": "assistant", "content": full_resp})
+        
