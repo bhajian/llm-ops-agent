@@ -16,13 +16,14 @@ from typing import Callable, Dict, List
 import json
 
 from langchain.schema import SystemMessage, HumanMessage, AIMessage
-from langchain_core.pydantic_v1 import BaseModel, Field
+from pydantic import BaseModel, Field
 from langchain.output_parsers import PydanticOutputParser, OutputFixingParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from app.llm import get_llm
 from app.chat_memory import chat_with_memory
-from app.fmp_agent import get_fmp_agent
+# UPDATED IMPORT: Agent modules are now in app/agents/
+from app.agents.fmp_agent import get_fmp_agent
 
 # ─── dynamically load RAG helper ────────────────────────────
 def _first_callable(module: str, *fn_names: str):
@@ -36,139 +37,90 @@ def _first_callable(module: str, *fn_names: str):
             return obj
     return None
 
-get_rag_chain_from_module = _first_callable("app.rag_agent", "get_rag_chain")
+# UPDATED: The module string for dynamic import now points to the new location
+get_rag_chain_from_module = _first_callable("app.agents.rag_agent", "get_rag_chain")
+# You'll also need to ensure app.agents.k8s_agent is imported if used directly here,
+# but currently, it seems only FMP and RAG are pulled into agent_router directly.
+
 
 # ─── intent labels and Pydantic for routing output ──────────
 class Intent(str, Enum):
     CHAT = "CHAT"
-    COT_RAG = "COT_RAG"
     FINANCE = "FINANCE"
+    COT_RAG = "COT_RAG" # CoT = Chain of Thought (for RAG)
+
 
 class RouterOutput(BaseModel):
-    """Output schema for the router LLM, specifying the chosen intent."""
-    intent: Intent = Field(..., description="The recognized intent of the user's query.")
+    intent: Intent = Field(
+        ...,
+        description=(
+            "The intent of the user's message. "
+            "Choose 'FINANCE' if the user is asking a question about stocks, company financials, or any financial data. "
+            "Choose 'COT_RAG' if the user is asking a question that can be answered by retrieving information from documents. "
+            "Otherwise, choose 'CHAT' for general conversation or if no specific intent is detected."
+        )
+    )
 
-_router_parser = PydanticOutputParser(pydantic_object=RouterOutput)
-
-# **FIX FOR KeyError: '"intent"' (and previous schema-related KeyErrors)**
-# Manually generate the JSON schema string once.
-# This string will be embedded as a literal in the prompt template.
-_router_output_schema_json_string = ""
-try:
-    _router_output_schema_json_string = json.dumps(RouterOutput.model_json_schema(), indent=2)
-except AttributeError:
-    try:
-        _router_output_schema_json_string = json.dumps(RouterOutput.schema(), indent=2)
-    except AttributeError as e:
-        warnings.warn(f"Could not generate JSON schema string from RouterOutput: {e}. Output parser instructions might be missing or incorrect.")
-        _router_output_schema_json_string = "{}" # Fallback to empty schema if all fails
+_router_output_schema_json_string = json.dumps(RouterOutput.model_json_schema(), indent=2)
 
 
-# ─── helpers for handlers ───────────────────────────────────
-def _convert_history_to_messages(history: List[dict]) -> List[HumanMessage | AIMessage]:
-    messages = []
-    for item in history:
-        if item.get("content"):
-            if item["role"] == "user":
-                messages.append(HumanMessage(content=item["content"]))
-            elif item["role"] == "assistant":
-                messages.append(AIMessage(content=item["content"]))
-    return messages
+_router_llm = get_llm(temperature=0)
+_robust_router_parser = OutputFixingParser.from_llm(parser=PydanticOutputParser(pydantic_object=RouterOutput), llm=_router_llm)
 
-# ─── handlers for each intent ───────────────────────────────
-async def _handle_chat(q: str, h: List[dict], cid: str) -> str:
-    return await asyncio.to_thread(chat_with_memory, q, h)
 
-async def _handle_finance(q: str, h: List[dict], cid: str) -> str:
-    fmp_agent = get_fmp_agent()
-    try:
-        result = await fmp_agent.ainvoke({"input": q, "chat_history": _convert_history_to_messages(h)})
-        return result["output"] if isinstance(result, dict) and "output" in result else str(result)
-    except Exception as e:
-        warnings.warn(f"FMP Agent failed during ainvoke: {e}")
-        return "I had trouble getting financial information. Please try again or rephrase your query."
-
-async def _handle_cot_rag(q: str, h: List[dict], cid: str) -> str:
-    if get_rag_chain_from_module:
-        rag_chain = get_rag_chain_from_module()
-        try:
-            result = await rag_chain.ainvoke({"input": q, "chat_history": _convert_history_to_messages(h)})
-            answer = result["answer"] if isinstance(result, dict) and "answer" in result else str(result)
-
-            print("🔍 RAG retrieved chunks:")
-            for i, doc in enumerate(result.get("context", [])):
-                print(f"📄 [Doc {i+1}] {doc.metadata.get('source', 'Unknown source')}:")
-                print(doc.page_content[:300])
-                print("---")
-
-            return answer
-        except Exception as e:
-            warnings.warn(f"COT RAG Agent failed during ainvoke: {e}")
-            return "I had trouble understanding and retrieving information from documents. Please try again."
-    return await _handle_chat(q, h, cid)
-
-DEST: Dict[Intent, Callable[[str, List[dict], str], str]] = {
-    Intent.CHAT: _handle_chat,
-    Intent.FINANCE: _handle_finance,
-    Intent.COT_RAG: _handle_cot_rag,
-}
-
-# ─── router LLM configuration ───────────────────────────────
-_router_llm = get_llm()
-if hasattr(_router_llm, "temperature"):
-    try:
-        _router_llm.temperature = 0.0
-    except Exception:
-        pass
-
-_robust_router_parser = OutputFixingParser.from_llm(parser=_router_parser, llm=_router_llm)
-
-# **CRITICAL**: Router Prompt designed for strict JSON output
-# Using separate SystemMessages to avoid formatting conflicts with JSON schema
 _ROUTER_PROMPT = ChatPromptTemplate.from_messages([
     SystemMessage(content=(
-        "You are an intelligent routing agent. Your task is to analyze the user's message and recent chat history to determine which specialized agent should handle the request."
-        "\n\n---"
-        "\nAVAILABLE AGENTS:"
-        "\n- CHAT: Use for general conversation, greetings, casual chat, or questions that do not require specific tools or document lookup. This is the default if no other agent is clearly appropriate."
-        "\n- FINANCE: Use for any questions specifically related to stock prices, company earnings, financial fundamentals (like P/E ratio, dividends), historical stock data, or information about specific publicly traded companies/tickers. This agent uses financial APIs."
-        "\n- COT_RAG: Use for questions that require retrieving information from documents, knowledge bases, or specific files that have been ingested into the system. This includes questions about specific people, summaries of ingested content, or asking for information that would typically be found in a detailed document."
-        "\n\n---"
-        "\nOUTPUT INSTRUCTIONS:"
-        "\nYour response MUST be a JSON object with a single key 'intent'."
-        "\nThe value of 'intent' MUST be one of the AVAILABLE AGENTS (CHAT, FINANCE, COT_RAG)."
-        "\nDO NOT include any other text, explanations, apologies, or punctuation outside the JSON object."
-        "\n\nExample Valid Output:"
-        "\n```json"
-        "\n{\"intent\": \"FINANCE\"}"
-        "\n```"
-        "\nConsider the user's intent very carefully. Be decisive."
-     )
-    ),
-    # THIS IS THE FINAL CRITICAL CHANGE: The JSON schema as a completely separate SystemMessage.
-    # It ensures the schema string is passed literally to the LLM without any
-    # string.format() interference from the main template.
-    SystemMessage(content=f"Here is the JSON schema you must adhere to:\n```json\n{_router_output_schema_json_string}\n```"),
+        "You are an expert at routing user questions or statements to the most appropriate agent or action "
+        "based on the user's intent. "
+        "Your decision should be based *solely* on the current user input and the preceding chat history. "
+        "You MUST choose one of the following intents and provide ONLY the JSON output, with no additional text or explanation."
+        "\n\n--- Available Intents ---"
+        "\n- CHAT: Select 'CHAT' for general conversation, greetings, personal questions (e.g., 'What is my name?'), "
+        "or statements providing information about the user (e.g., 'My name is Behnam', 'I like pizza'). "
+        "This is the **default and broadest intent** if no other specific intent clearly applies. "
+        "Choose CHAT if the query lacks clear financial keywords or a request for document-based information, or if it's a simple conversational turn."
+        "\n- FINANCE: **CRITICAL**: Choose 'FINANCE' ONLY if the user is asking specifically about **stock prices, company financials, earnings, market news, dividends, price targets, or any other data directly related to financial markets for a specific company or the market as a whole.** "
+        "This intent *requires* the use of specialized financial tools. Do NOT choose FINANCE for general conversation, personal information, or non-financial topics."
+        "\n- COT_RAG: Select 'COT_RAG' ONLY for questions that require retrieving factual information from internal documents, knowledge bases, or asking for details from previously provided text. "
+        "This includes queries about people, events, concepts, or summaries found within your indexed documents. "
+        "Examples: 'Who is Bahram Hajian?', 'What is the history of AI?', 'Summarize the document about project X.', 'What are the key findings of the report?'"
+        "\n\n--- Example of Intent Routing ---"
+        "\nUser Input: 'Hello there!' -> Intent: CHAT"
+        "\nUser Input: 'What is Apple's stock price?' -> Intent: FINANCE"
+        "\nUser Input: 'Summarize the document I just uploaded.' -> Intent: COT_RAG"
+        "\nUser Input: 'My favorite color is blue.' -> Intent: CHAT"
+        "\nUser Input: 'Tell me about the new security policy.' -> Intent: COT_RAG" # Explicit example for RAG
+        "\n\n{format_instructions}"
+    )),
     MessagesPlaceholder(variable_name="chat_history"),
-    HumanMessage(content="{input}"), # Ensure human message also uses template variable
+    HumanMessage(content="{input}"),
 ])
 
 
 def _choose_intent(user_msg: str, chat_history: List[dict]) -> Intent:
+    format_instructions = _robust_router_parser.get_format_instructions()
+    
     messages_for_router = _ROUTER_PROMPT.format_messages(
         input=user_msg,
-        chat_history=_convert_history_to_messages(chat_history)
+        chat_history=_convert_history_to_messages(chat_history),
+        format_instructions=format_instructions
     )
     llm_response = None
+    raw_content = "N/A" # Initialize raw_content outside try block
     try:
         llm_response = _router_llm.invoke(messages_for_router)
         
-        parsed_output = _robust_router_parser.parse(llm_response.content)
+        # Safely extract content from llm_response
+        if hasattr(llm_response, 'content'):
+            raw_content = llm_response.content.strip()
+        else:
+            raw_content = str(llm_response).strip()
+
+        parsed_output = _robust_router_parser.parse(raw_content)
         intent = parsed_output.intent
-        print(f"🧭 Router LLM chose: {intent.value} (from raw response: '{llm_response.content.strip()}')")
+        print(f"🧭 Router LLM chose: {intent.value} (from raw response: '{raw_content}')")
         return intent
     except Exception as e:
-        raw_content = llm_response.content.strip() if llm_response else "N/A"
         warnings.warn(f"Router LLM failed to make a decision or parse output: {e}. Raw response: '{raw_content}'. Falling back to CHAT.")
         return Intent.CHAT
 
@@ -177,8 +129,58 @@ async def route_query(user_msg: str,
                       history: List[dict],
                       chat_id: str) -> str:
     """
-    Routes the user's query to the appropriate agent based on LLM intent classification.
+    Routes the user's query to the appropriate agent based on LLM decision.
     """
+    # 1. Choose intent via LLM
     intent = _choose_intent(user_msg, history)
-    handler = DEST[intent]
-    return await handler(user_msg, history, chat_id)
+
+    # 2. Call appropriate agent based on intent
+    answer = ""
+    if intent == Intent.CHAT:
+        answer = chat_with_memory(user_msg, history)
+    elif intent == Intent.FINANCE:
+        # TODO: Ensure FMP agent uses async `ainvoke` if available for performance
+        try:
+            fmp_agent = get_fmp_agent()
+            # If the agent is async, use ainvoke, otherwise invoke in a thread
+            if hasattr(fmp_agent, "ainvoke"):
+                result = await fmp_agent.ainvoke({"input": user_msg, "chat_history": _convert_history_to_messages(history)})
+            else:
+                result = await asyncio.to_thread(fmp_agent.invoke, {"input": user_msg, "chat_history": _convert_history_to_messages(history)})
+            answer = result.get("output", "Could not get an answer from the FMP agent.")
+        except Exception as e:
+            warnings.warn(f"FMP Agent failed during ainvoke: {e}")
+            answer = "I'm sorry, I encountered an error while trying to get financial data."
+    elif intent == Intent.COT_RAG:
+        if get_rag_chain_from_module:
+            try:
+                rag_chain = get_rag_chain_from_module()
+                if hasattr(rag_chain, "ainvoke"):
+                    result = await rag_chain.ainvoke({"input": user_msg, "chat_history": _convert_history_to_messages(history)})
+                else:
+                    result = await asyncio.to_thread(rag_chain.invoke, {"input": user_msg, "chat_history": _convert_history_to_messages(history)})
+                answer = result.get("answer", "I could not find relevant information in the documents.")
+            except Exception as e:
+                warnings.warn(f"RAG Agent failed during ainvoke: {e}")
+                answer = "I'm sorry, I encountered an error while trying to retrieve information from documents."
+        else:
+            warnings.warn("RAG agent module 'app.agents.rag_agent' or 'get_rag_chain' not found. Falling back to CHAT.")
+            answer = chat_with_memory(user_msg, history) # Fallback to chat if RAG is not available
+    else:
+        # Fallback for any unhandled intent, though enum should prevent this
+        answer = chat_with_memory(user_msg, history)
+        warnings.warn(f"Unhandled intent: {intent}. Falling back to CHAT.")
+    
+    return answer
+
+# ───────────────── helpers ───────────────────────────────────────────────
+def _convert_history_to_messages(history: List[dict]) -> List[AIMessage | HumanMessage]:
+    """Converts the raw history dicts to LangChain message objects."""
+    converted_messages = []
+    for entry in history:
+        if entry["role"] == "user":
+            converted_messages.append(HumanMessage(content=entry["content"]))
+        elif entry["role"] == "assistant":
+            # For assistant messages, ensure we only take content, not scratch
+            converted_messages.append(AIMessage(content=entry["content"]))
+    return converted_messages

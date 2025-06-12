@@ -22,6 +22,10 @@ def _env(key: str, default: str | None = None) -> str | None:
 @lru_cache
 def get_settings() -> dict:
     return {
+        # ─── Bedrock ──────────────────────────────────────────
+        "bedrock_region":  _env("BEDROCK_REGION", _env("AWS_REGION", "us-east-2")),
+        "bedrock_profile": _env("AWS_PROFILE"),          # optional named credentials
+        "bedrock_embedding_model": _env("BEDROCK_EMBED_MODEL", "amazon.titan-embed-text-v2:0"), # <--- ADDED/FIXED THIS LINE
         # ─── Data Layer ─────────────────────────────────────
         "redis_host":    _env("REDIS_HOST", "redis"),
         "weaviate_url":  _env("WEAVIATE_URL", "http://weaviate:8080"),
@@ -47,8 +51,8 @@ def get_settings() -> dict:
         "redis_ttl": int(_env("REDIS_TTL", str(60 * 60 * 24 * 7))),
 
         # ─── Embeddings ────────────────────────────────────
-        # Used when backend is not OpenAI or overridden
-        "embedding_model": _env(
+        # Used when backend is not OpenAI or overridden (e.g., for HuggingFace local/hub)
+        "embedding_model": _env( # Kept this for non-Bedrock/OpenAI embedding models
             "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
         ),
     }

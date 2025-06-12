@@ -62,20 +62,28 @@ services:
   agent-server:
     build: .
     environment:
-      HUGGINGFACE_HUB_TOKEN: ${HUGGINGFACE_HUB_TOKEN}
-      LLM_BACKEND:  ${LLM_BACKEND:-openai}
-      LLM_BASE_URL: ${LLM_BASE_URL:-}
-      LLM_MODEL:    ${LLM_MODEL}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-
-      REDIS_HOST:   redis
-      WEAVIATE_URL: http://weaviate:8080
-      FMP_FASTAPI_URL:  http://mcp-fmp:5000     # ← match fmp_tools.py
-      MCP_K8S_URL:  http://mcp-openshift:9000
-      MCP_USERNAME: ${MCP_USERNAME:-admin}
-      MCP_PASSWORD: ${MCP_PASSWORD:-secret}
-      ADMIN_TOKEN:  ${ADMIN_TOKEN:-supersecrettoken}
+      - LANGCHAIN_TRACING_V2=true
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
+      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - BEDROCK_REGION=${BEDROCK_REGION}
+      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND} # CORRECTED LINE
+      # - HUGGINGFACE_HUB_TOKEN: ${HUGGINGFACE_HUB_TOKEN:-admin}
+      - LLM_BACKEND=${LLM_BACKEND:-bedrock} # CORRECTED FOR CONSISTENCY
+      - LLM_BASE_URL=${LLM_BASE_URL:-} # CORRECTED FOR CONSISTENCY
+      - LLM_MODEL=${LLM_MODEL} # CORRECTED FOR CONSISTENCY
+      # - EMBEDDING_MODEL=${EMBEDDING_MODEL} # CORRECTED FOR CONSISTENCY
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-} # CORRECTED FOR CONSISTENCY
+      - BEDROCK_EMBED_MODEL=${BEDROCK_EMBED_MODEL}
+      - REDIS_HOST=redis # CORRECTED FOR CONSISTENCY
+      - WEAVIATE_URL=http://weaviate:8080 # CORRECTED FOR CONSISTENCY
+      - FMP_FASTAPI_URL=http://mcp-fmp:5000 # CORRECTED FOR CONSISTENCY
+      - MCP_K8S_URL=http://mcp-openshift:9000 # CORRECTED FOR CONSISTENCY
+      - MCP_USERNAME=${MCP_USERNAME:-admin} # CORRECTED FOR CONSISTENCY
+      - MCP_PASSWORD=${MCP_PASSWORD:-secret} # CORRECTED FOR CONSISTENCY
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-supersecrettoken} # CORRECTED FOR CONSISTENCY
 
     volumes:
       - ./:/app
@@ -105,3 +113,4 @@ services:
       agent-server:
         condition: service_started
     ports: ["8501:8501"]         # expose UI to host
+    
