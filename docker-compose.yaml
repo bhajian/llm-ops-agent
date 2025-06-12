@@ -1,23 +1,28 @@
-# ────────────── Named volumes (persistent) ──────────────
-volumes:
-  redis-data: 
-  weaviate-data: 
+version: "3.9"
 
+################################################################################
+#                       PERSISTENT VOLUMES
+################################################################################
+volumes:
+  redis-data:
+  weaviate-data:
+
+################################################################################
+#                           DATA LAYER
+################################################################################
 services:
-# ────────────── DATA LAYER ──────────────
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
     volumes:
-      - ./data/redis:/data
+      - redis-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
-    ports: ["6379:6379"]        # ← host-level access (optional)
-    expose: ["6379"]            # internal network (redundant if ports above)
+    ports: ["6379:6379"]        # host access (optional)
 
   weaviate:
     image: semitechnologies/weaviate:1.24.8
@@ -28,65 +33,53 @@ services:
       ENABLE_MODULES: text2vec-openai,text2vec-huggingface
       OPENAI_APIKEY: ${OPENAI_API_KEY:-}
     volumes:
-      - ./data/weaviate:/var/lib/weaviate
+      - weaviate-data:/var/lib/weaviate
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
-    expose: ["8080"]             # internal use
-    ports: ["8080:8080"]         # reach Weaviate from host if needed
+    ports: ["8080:8080"]
 
-# ────────────── MCP SERVERS ──────────────
+################################################################################
+#                           MCP SERVERS
+################################################################################
   mcp-openshift:
-    build: ./mcp-openshift
+    build: ./app/mcp-openshift
     environment:
       MCP_USERNAME: ${MCP_USERNAME:-admin}
       MCP_PASSWORD: ${MCP_PASSWORD:-secret}
       KUBECONFIG: /app/.kube/config
       PORT: 9000
-    expose: ["9000"]             # only agent needs this
-    ports: ["9101:9000"]         # expose to host (optional)
+    ports: ["9101:9000"]
     restart: unless-stopped
 
   mcp-fmp:
-    build: ./mcp-fmp
+    build: ./app/mcp-fmp
     environment:
       PORT: 5000
       FMP_API_KEY: ${FMP_API_KEY}
-    expose: ["5000"]             # agent uses this internally
     ports:
-      - "${HOST_PORT:-9100}:5000"  # host access → localhost:9100
+      - "${HOST_PORT:-9100}:5000"
     restart: unless-stopped
 
-# ────────────── AGENT (FastAPI + RAG) ──────────────
+################################################################################
+#                      AGENT API (FastAPI + LangGraph)
+################################################################################
   agent-server:
-    build: .
+    build:
+      context: ./app          # code lives here
+      dockerfile: ../Dockerfile   # Dockerfile at repo root
+    env_file: .env
     environment:
-      - LANGCHAIN_TRACING_V2=true
-      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
-      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
-      - BEDROCK_REGION=${BEDROCK_REGION}
-      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND}
-      - LLM_BACKEND=${LLM_BACKEND:-bedrock}
-      - LLM_BASE_URL=${LLM_BASE_URL:-}
-      - LLM_MODEL=${LLM_MODEL}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - BEDROCK_EMBED_MODEL=${BEDROCK_EMBED_MODEL}
-      - REDIS_HOST=redis
-      - WEAVIATE_URL=http://weaviate:8080
-      - FMP_FASTAPI_URL=http://mcp-fmp:5000
-      - MCP_K8S_URL=http://mcp-openshift:9000
-      - MCP_USERNAME=${MCP_USERNAME:-admin}
-      - MCP_PASSWORD=${MCP_PASSWORD:-secret}
-      - ADMIN_TOKEN=${ADMIN_TOKEN:-supersecrettoken}
-
+      PYTHONPATH: /app               # ensure 'src' importable in reloader
+      LANGCHAIN_TRACING_V2: "true"
+      REDIS_URL: redis://redis:6379/0
+      WEAVIATE_URL: http://weaviate:8080
+      FMP_FASTAPI_URL: http://mcp-fmp:5000
+      MCP_K8S_URL: http://mcp-openshift:9000
     volumes:
-      - ./:/app
-    command: >
-      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      - ./app:/app                   # live-reload during dev
+    command: python -m uvicorn src.api.server:app --host 0.0.0.0 --port 8000 --reload
     restart: unless-stopped
     depends_on:
       weaviate:
@@ -95,19 +88,20 @@ services:
         condition: service_started
       mcp-fmp:
         condition: service_started
-    expose: ["8000"]             # internal (ui)
-    ports: ["8000:8000"]         # host access for API
+    ports: ["8000:8000"]
 
-# ────────────── SIMPLE STREAMLIT UI ──────────────
+################################################################################
+#                           STREAMLIT UI
+################################################################################
   ui:
-    build: ./ui
+    build: ./app/ui
     environment:
       BACKEND_URL: http://agent-server:8000
-      AUTH_TOKEN:  ${ADMIN_TOKEN:-supersecrettoken}
+      AUTH_TOKEN: ${ADMIN_TOKEN:-supersecrettoken}
       STREAMLIT_SERVER_RUNONSAVE: "true"
     volumes:
-      - ./ui:/app
+      - ./app/ui:/app
     depends_on:
       agent-server:
         condition: service_started
-    ports: ["8501:8501"]         # expose UI to host
+    ports: ["8501:8501"]
