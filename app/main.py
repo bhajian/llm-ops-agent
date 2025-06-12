@@ -17,6 +17,19 @@ from app.tools.vector_utils import ingest_file_to_weaviate # For ingest endpoint
 app = FastAPI()
 
 # ─────────────────────────────────────────────────────────────
+# Helper to check for initial chat trigger phrases
+def _is_initial_chat_trigger(query: str, chat_id: str) -> bool:
+    """
+    Checks if the query indicates a new chat session and there's no existing history.
+    """
+    normalized_query = query.lower().strip()
+    # Check for empty query or common greeting phrases
+    if not normalized_query or normalized_query in ["start chat", "hello", "hi", "hey", "help"]:
+        # Only consider it an initial trigger if chat history for this ID is empty
+        return not load_chat(chat_id)
+    return False
+
+# ─────────────────────────────────────────────────────────────
 # /chat  (non-stream) - REFACTORED
 # ─────────────────────────────────────────────────────────────
 @app.post("/chat")
@@ -25,19 +38,24 @@ async def chat(req: Request, user: str = Depends(verify_token)):
     query = body.get("query", "")
     cid = body.get("chat_id", user)
 
-    print(f"💬 /chat received query: {query}")
+    print(f"💬 /chat received query: '{query}' for chat_id: '{cid}'")
 
-    # 1. Load history
+    # 1. Handle initial empty query or specific start phrases with a static welcome message
+    if _is_initial_chat_trigger(query, cid):
+        welcome_message = "Hello! How can I help you today?"
+        print(f"✅ Returning static welcome message for new chat or initial greeting.")
+        return JSONResponse({"response": welcome_message, "chat_id": cid})
+
+    # 2. Load history (only if not an initial empty query handled above)
     history = load_chat(cid)
 
-    # 2. Delegate EVERYTHING to the agent router. No more if/else logic.
-    # The router is now fully responsible for picking AND running the correct agent.
-    answer = await route_query(query, history, cid) # Calls the async route_query directly
+    # 3. Delegate EVERYTHING to the agent router.
+    answer = await route_query(query, history, cid) 
 
     print(f"✅ Router returned answer: {answer}")
 
-    # 3. Save the final answer
-    save_chat(cid, query, answer) # Removed scratch as it's not consistently returned by all agents now
+    # 4. Save the final answer
+    save_chat(cid, query, answer) 
 
     return JSONResponse({"response": answer, "chat_id": cid})
 
@@ -66,16 +84,22 @@ class _TokenBuffer(AsyncCallbackHandler):
 # ─────────────────────────────────────────────────────────────
 @app.post("/chat/stream")
 async def chat_stream(req: Request, user: str = Depends(verify_token)):
-    # This endpoint would also be simplified to call a streaming-capable router function.
-    # We can address the complexities of generic streaming after fixing the core logic.
     body = await req.json()
     query = body.get("query", "")
     cid = body.get("chat_id", user)
+    
+    print(f"💬 /chat/stream received query: '{query}' for chat_id: '{cid}'")
+
+    # 1. Handle initial empty query or specific start phrases with a static welcome message
+    if _is_initial_chat_trigger(query, cid):
+        welcome_message = "Hello! How can I help you today?"
+        async def welcome_stream():
+            yield welcome_message
+        print(f"✅ Returning static welcome message stream for new chat or initial greeting.")
+        return StreamingResponse(welcome_stream(), media_type="text/plain")
+
     history = load_chat(cid)
 
-    # For now, keeping it simple as discussed, but the full streaming solution
-    # would involve more complex changes to route_query itself.
-    # The non-streaming route_query is called here.
     answer = await route_query(query, history, cid)
     save_chat(cid, query, answer)
 

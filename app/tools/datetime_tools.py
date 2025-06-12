@@ -12,6 +12,7 @@ def _get_current_datetime() -> str:
     """
     Returns the current date and time in ISO format (YYYY-MM-DD HH:MM:SS).
     """
+    # FIX: Use datetime.now() to get the current date and time dynamically
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 get_current_datetime_tool = StructuredTool.from_function(

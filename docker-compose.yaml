@@ -1,7 +1,7 @@
 # ────────────── Named volumes (persistent) ──────────────
 volumes:
-  redis-data:
-  weaviate-data:
+  redis-data: 
+  weaviate-data: 
 
 services:
 # ────────────── DATA LAYER ──────────────
@@ -9,7 +9,7 @@ services:
     image: redis:7-alpine
     command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
     volumes:
-      - redis-data:/data
+      - ./data/redis:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -28,7 +28,7 @@ services:
       ENABLE_MODULES: text2vec-openai,text2vec-huggingface
       OPENAI_APIKEY: ${OPENAI_API_KEY:-}
     volumes:
-      - weaviate-data:/var/lib/weaviate
+      - ./data/weaviate:/var/lib/weaviate
     restart: unless-stopped
     depends_on:
       redis:
