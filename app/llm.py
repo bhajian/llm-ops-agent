@@ -6,7 +6,7 @@
 #   • LLM_BACKEND         = bedrock | openai | vllm | local | gemini
 #   • EMBEDDING_BACKEND   = bedrock | openai | hf | local | auto | gemini
 #
-# Bedrock extras (typical):
+# Bedrock extras (typical):\
 #   • BEDROCK_REGION          us-east-2
 #   • BEDROCK_PROFILE         bedrock-admin   (optional)
 #   • BEDROCK_EMBED_MODEL     amazon.titan-embed-text-v2:0
@@ -109,14 +109,13 @@ def get_llm(
 
         client_config = Config(read_timeout=120)
 
-        # Initialize model_kwargs. **Crucially, include temperature here.**
         llm_model_kwargs = {"temperature": temp} 
 
-        # For Llama models, LangChain might add stop_sequences by default in agent flows.
-        # Setting it to empty list if the model doesn't support it (e.g., Llama 3/4 in some Bedrock APIs)
-        if _MODEL.startswith("meta.llama3") or _MODEL.startswith("meta.llama4"):
-            llm_model_kwargs["stop_sequences"] = [] 
-
+        # FIX: Remove stop_sequences for Llama 3/4 if they are causing issues.
+        # The error "Stop sequence key name for meta is not supported" means
+        # even passing an empty list for this key is problematic for these specific models.
+        # We will no longer conditionally add 'stop_sequences': []
+        
         # Determine if it's a chat-specific model or a general text model
         if _MODEL.startswith("anthropic.claude") or _MODEL.startswith("meta.llama3") or _MODEL.startswith("meta.llama4"):
             # Use ChatBedrock for models that typically follow chat message structure
@@ -127,7 +126,6 @@ def get_llm(
                 credentials_profile_name=_BEDROCK_PROFILE,
                 streaming=streaming,
                 callbacks=callbacks or [],
-                # Removed 'temperature=temp' as a direct argument here
                 model_kwargs=llm_model_kwargs # temperature is now inside llm_model_kwargs
             )
         else: # For other Bedrock text models not covered by above conditions
@@ -138,7 +136,6 @@ def get_llm(
                 credentials_profile_name=_BEDROCK_PROFILE,
                 streaming=streaming,
                 callbacks=callbacks or [],
-                # Removed 'temperature=temp' as a direct argument here
                 model_kwargs=llm_model_kwargs # temperature is now inside llm_model_kwargs
             )
 

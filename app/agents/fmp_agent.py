@@ -5,61 +5,54 @@ MCP-FMP FastAPI server. This agent uses an LLM to decide which financial
 tools to call based on the user's query.
 """
 from __future__ import annotations
-from functools import lru_cache
-# IMPORT CHANGE: Use initialize_agent and AgentType for Bedrock compatibility
+from functools import lru_cache # Keep import for consistency, but not used on this function
+# Revert imports: Use initialize_agent and AgentType again
 from langchain.agents import AgentExecutor, initialize_agent, AgentType, Tool
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder # Keep for clarity, but less critical here
 from app.tools.fmp_tools import get_fmp_tools
 from app.llm import get_llm
 from app.tools.datetime_tools import get_current_datetime_tool
 
-@lru_cache
+# REMOVED @lru_cache here to ensure a fresh agent is always created
 def get_fmp_agent() -> AgentExecutor:
     """
-    Creates and returns a cached singleton of the FMP AgentExecutor.
-    The agent uses an LLM to reason about which tools to use from the provided list.
+    Creates and returns an AgentExecutor using initialize_agent with ReAct.
+    The agent uses an LLM to reason about which tools to call based on the user's query.
     """
     fmp_tools = get_fmp_tools()
     
     # Combine FMP tools with the new datetime tool
-    # Convert StructuredTools to basic Tools for initialize_agent if necessary
-    # initialize_agent with STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION can often handle StructuredTools directly
-    # but sometimes explicit conversion to Tool is safer if tool arguments are simple.
-    # We'll pass StructuredTools directly first and see if it works.
+    # initialize_agent handles StructuredTools well, so no explicit Tool wrapping needed.
     tools = fmp_tools + [get_current_datetime_tool]
 
-    llm = get_llm(temperature=0) # Use the Bedrock LLM
+    # Pass streaming=True to the get_llm() call here
+    llm = get_llm(temperature=0, streaming=True) # Ensure LLM supports streaming for async agent operations
 
-    # With AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
-    # the prompt is implicitly handled by the agent type's internal logic,
-    # but we still define a system message for overall behavior.
-    # The agent will inject its own thought/action/observation steps.
-
-    # NOTE: The system prompt here is LESS CRITICAL for tool formatting
-    # compared to create_openai_functions_agent, as the agent type
-    # generates its own internal prompt for ReAct. However, it still
-    # sets the overall persona and high-level rules.
+    # Define the system message content directly
     system_message_content = (
-        "You are an expert financial assistant. You must use the available tools to answer the user's questions about stocks and financial data. "
-        "Use the tools provided to answer questions."
-        "\nKey Instructions:"
-        "\n1. For any question about a specific company, you MUST first use the 'search_symbol' tool to find the correct stock ticker if one is not explicitly provided. "
-        "\n2. Use the 'get_current_datetime' tool when the user asks for the current date or time, or if a financial query requires knowing the current date (e.g., 'What is XYZ stock price today?')."
-        "\n3. Do not make up information; only use the data provided by the tools. If a tool returns no data for a specific request, state that you couldn't retrieve the information."
-        "\n4. If a user asks a vague question, ask for clarification (e.g., 'What company are you asking about?')."
-        "\n5. Always provide a concise disclaimer about the volatility of stock prices and the importance of professional financial advice, but keep it after presenting the data."
+        "You are an expert financial assistant. Use the provided tools to answer questions about stock prices, company financials, and market data. "
+        "You must answer questions by using the available tools and providing factual data. "
+        "Strictly adhere to the following rules for tool usage and response generation:"
+        "\n1. Always attempt to use a tool if the query is financial or asks for date/time. Do not answer from general knowledge if a tool can provide the information."
+        "\n2. For stock-related queries, always try to use the 'search_symbol' tool first to resolve company names to ticker symbols if the ticker is not explicitly provided. "
+        "Then, use the appropriate FMP tool (e.g., 'get_stock_quote') with the resolved ticker."
+        "\n3. Use the 'get_current_datetime' tool when the user asks for the current date or time, or if a financial query requires knowing the current date (e.e.g., 'What is XYZ stock price today?')."
+        "\n4. Do not make up information; only use the data provided by the tools. If a tool returns no data for a specific request, state that you couldn't retrieve the information."
+        "\n5. If a user asks a vague question, ask for clarification (e.g., 'What company are you asking about?')."
+        "\n6. Always provide a concise disclaimer about the volatility of stock prices and the importance of professional financial advice, but keep it after presenting the data. Do NOT include this disclaimer if the query was for datetime only."
         # The agent type automatically adds observation/thought steps for ReAct
     )
 
-    # initialize_agent is an older way to create agents, but necessary for
-    # non-OpenAI function calling models with a general ReAct approach.
+    # Use initialize_agent with AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION
+    # This type does not require bind_tools, but uses a ReAct-style prompt.
     agent_executor = initialize_agent(
         tools=tools,
         llm=llm,
-        agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION, # This is the key change
+        agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION, # Reverted to this agent type
         verbose=True, # Keep verbose to see agent's thought process
         handle_parsing_errors=True,
-        agent_kwargs={"system_message": system_message_content}, # Pass system message
+        agent_kwargs={"system_message": system_message_content}, # Pass system message as agent_kwargs
+        # llm_kwargs={"stop_sequences": []}, # Not needed for initialize_agent, as LLM handles this via get_llm config
         # IMPORTANT: max_iterations might be needed to prevent infinite loops on complex tasks
         # max_iterations=5,
         # early_stopping_method="generate"
