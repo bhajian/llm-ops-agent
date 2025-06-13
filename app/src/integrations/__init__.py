@@ -10,6 +10,12 @@ from .mcp_client import MCPClient
 from .weaviate_client import WeaviateVectorClient
 from .redis_client import get_redis, Blackboard
 
+import logging
+logging.basicConfig(
+    level=logging.DEBUG,                        # DEBUG, INFO, WARNING, …
+    format="%(asctime)s | %(name)12s | %(levelname)5s | %(message)s",
+)
+
 # ─── Lazy factories ──────────────────────────────────────────────
 @lru_cache
 def get_mcp_client() -> MCPClient:

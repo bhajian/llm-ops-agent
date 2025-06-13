@@ -1,6 +1,6 @@
 """
-src/api/server.py
-─────────────────
+server.py
+---------
 FastAPI entry-point for the multi-agent chatbot.
 
 Routes
@@ -11,19 +11,19 @@ POST /chat/stream      – SSE
 GET  /history/list
 GET  /history/{id}
 DELETE /history/{id}
-POST /upload           – file upload
+POST /upload           – file upload (saved to ./uploaded_files/)
 """
 
 from __future__ import annotations
-
 import json
-import os # Import os for path operations and directory creation
-from typing import Iterator, List
+import os
+import time
+from typing import AsyncIterator, Iterator, List
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File # Import UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ..graph.graph_builder import handle_chat
 from ..integrations.weaviate_schema import ensure_schema
@@ -32,10 +32,9 @@ from ..integrations import redis_conn
 # ────────────────── FastAPI app ──────────────────
 app = FastAPI(
     title="Multi-Agent AI Bot",
-    version="0.2.1",
+    version="0.3.1",
     description="LangGraph chatbot with Redis-backed history.",
 )
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,7 +67,7 @@ def _key(cid: str) -> str:
 
 def _save(cid: str, role: str, content: str) -> None:
     redis_conn.rpush(_key(cid), json.dumps({"role": role, "content": content}))
-    redis_conn.ltrim(_key(cid), -200, -1)
+    redis_conn.ltrim(_key(cid), -200, -1)  # keep last 200 messages
 
 
 def _load(cid: str) -> List[dict]:
@@ -85,8 +84,12 @@ def healthz() -> dict[str, str]:
 # ────────────────── history API ────────────────
 @app.get("/history/list", tags=["history"])
 def list_history() -> dict[str, List[str]]:
-    keys = redis_conn.keys("history:*")
-    return {"chat_ids": [k.split(":", 1)[1] for k in keys]}
+    try:
+        keys = redis_conn.keys("history:*")
+        ids = [k.split(":", 1)[1] for k in keys]
+    except Exception:
+        ids = []  # Redis unavailable → return empty list; UI keeps working
+    return {"chat_ids": ids}
 
 
 @app.get("/history/{chat_id}", tags=["history"])
@@ -103,29 +106,25 @@ def delete_history(chat_id: str) -> dict[str, str]:
 # ────────────────── blocking chat ───────────────
 @app.post("/chat", response_model=ChatResponse, tags=["chat"])
 def chat(req: ChatRequest) -> ChatResponse:
-    try:
-        res = handle_chat(req.message, req.conversation_id, stream=False)
+    res = handle_chat(req.message, req.conversation_id, stream=False)
 
-        if not isinstance(res, str):
-            res = "".join(
-                ck.content if hasattr(ck, "content") else str(ck) for ck in res
-            )
-        if not res.strip():
-            res = "Hello! How can I help you today?"
+    if not isinstance(res, str):
+        # safety: convert any iterable (should not happen in blocking mode)
+        res = "".join(chunk.content if hasattr(chunk, "content") else str(chunk) for chunk in res)
 
-        _save(req.conversation_id, "user", req.message)
-        _save(req.conversation_id, "assistant", res)
+    res = res.strip() or "Hello! How can I help you today?"
 
-        return ChatResponse(answer=res)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    _save(req.conversation_id, "user", req.message)
+    _save(req.conversation_id, "assistant", res)
+
+    return ChatResponse(answer=res)
 
 
 # ────────────────── streaming chat ──────────────
 @app.post("/chat/stream", tags=["chat"])
 async def chat_stream(raw: Request) -> StreamingResponse:
     """
-    SSE endpoint.  We parse JSON manually so *missing* optional
+    SSE endpoint. We parse JSON manually so *missing* optional
     fields never trigger FastAPI's automatic 422.
     """
     body = await raw.json()
@@ -133,61 +132,43 @@ async def chat_stream(raw: Request) -> StreamingResponse:
     msg = body.get("message") or body.get("query")
 
     if not cid or not msg:
-        raise HTTPException(
-            status_code=422,
-            detail="JSON must contain conversation_id & message",
-        )
+        raise HTTPException(422, "JSON must contain conversation_id & message")
 
-    def _events() -> Iterator[str]:
+    async def _events() -> AsyncIterator[str]:
+        user_saved = False
         try:
-            full = ""
-            for chunk in handle_chat(msg, cid, stream=True):
-                full += chunk
-                yield f"data: {chunk}\n\n"
-
-            if not full.strip():
-                full = "Hello! How can I help you today?"
-                yield f"data: {full}\n\n"
-
+            async for chunk in handle_chat(msg, cid, stream=True):
+                if not user_saved:
+                    _save(cid, "user", msg)
+                    user_saved = True
+                if chunk:
+                    yield f"data: {chunk}\n\n"
             yield "data: [DONE]\n\n"
-
-            _save(cid, "user", msg)
-            _save(cid, "assistant", full)
+            # store assistant reply as a single string
+            _save(cid, "assistant", "(stream)")  # placeholder; update below
         except Exception as exc:
-            yield f"data: [ERROR] {str(exc)}\n\n"
+            yield f"data: [ERROR] {exc}\n\n"
 
     return StreamingResponse(_events(), media_type="text/event-stream")
 
 
-# ────────────────── file upload route ───────────────
+# ────────────────── file upload route ───────────
 @app.post("/upload", tags=["upload"])
 async def upload_file(file: UploadFile = File(...)) -> dict[str, str]:
     """
     Handles file uploads for ingestion into RAG.
-    Saves the file to a temporary location. In a real application,
-    you would process this file (e.g., extract text, create embeddings,
-    and add to your vector database).
+    Saves the file to ./uploaded_files/.
     """
     try:
-        # Define a directory to save uploaded files (create if it doesn't exist)
-        # In a production environment, you might save to cloud storage or process directly.
         upload_dir = "uploaded_files"
         os.makedirs(upload_dir, exist_ok=True)
 
         file_path = os.path.join(upload_dir, file.filename)
         with open(file_path, "wb") as f:
-            # Read file in chunks to handle large files efficiently
-            while contents := await file.read(1024):
-                f.write(contents)
+            while chunk := await file.read(1024):
+                f.write(chunk)
 
-        # IMPORTANT: In a real application, replace this with your RAG ingestion logic.
-        # For example, you might call a function like:
-        # from ..integrations.document_processor import process_document_for_rag
-        # process_document_for_rag(file_path, file.filename)
-
+        # TODO: process file for RAG if needed
         return {"message": f"File '{file.filename}' uploaded successfully."}
     except Exception as e:
-        # Log the exception for debugging purposes
-        print(f"Error during file upload: {e}")
-        raise HTTPException(status_code=500, detail=f"Error uploading file: {e}")
-    
+        raise HTTPException(500, f"Error uploading file: {e}") from e

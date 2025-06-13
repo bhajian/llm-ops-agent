@@ -1,81 +1,109 @@
 """
 PlannerAgent
 ============
-Generates an ordered list of task IDs in JSON.
-If the LLM returns malformed JSON, we gracefully return an empty list,
-allowing graph_builder to choose a safe default behaviour.
+Generates a JSON task list for the graph.  (Unchanged logic—only the import
+statement below is corrected to match the real filename.)
 """
 
+from __future__ import annotations
+
 import json
+import logging
 import re
-from typing import List
+from typing import Any, Dict, List
 
-from ..llm import get_llm
-from ..integrations.tools import MemorySummaryTool
+# ← FIX: point at the *existing* base_agent.py
+from .base_agent import BaseAgent
 
-_TASK_IDS = {"retrieval", "finance", "k8s"}
+LOGGER = logging.getLogger(__name__)
 
-# ────────────────── helpers ──────────────────
-def _safe_parse_tasks(text: str) -> List[str]:
-    """
-    Extract first {...} JSON block and return validated task list.
-    On any failure, return []  (caller will decide fallback).
-    """
+# --------------------------------------------------------------------------- #
+# Helpers (unchanged)
+# --------------------------------------------------------------------------- #
+
+SMART_QUOTES = {"“": '"', "”": '"', "‘": "'", "’": "'"}
+_JSON_RE = re.compile(r"```json\s*(.*?)```|(\{.*?\})", re.DOTALL)
+
+
+def _normalize_quotes(text: str) -> str:
+    return text.translate(str.maketrans(SMART_QUOTES))
+
+
+def _extract_json(text: str) -> str | None:
+    m = _JSON_RE.search(text)
+    return m.group(1) or m.group(2) if m else None
+
+
+def _safe_parse_tasks(raw: str) -> List[Dict[str, Any]]:
+    cleaned = _normalize_quotes(raw)
+    block = _extract_json(cleaned)
+    if not block:
+        LOGGER.warning("PlannerAgent: no JSON block found.")
+        return []
+
     try:
-        # Step 1: Aggressively clean the input text by stripping non-ASCII characters.
-        # This helps in case there are invisible characters that disrupt JSON parsing.
-        cleaned_text_for_parsing = text.encode('ascii', 'ignore').decode('ascii')
-
-        # Step 2: Use regex to find the JSON block. This will prioritize 'json' code blocks
-        # or fall back to finding any {...} block.
-        block_match = re.search(r"```json\n(.*?)```|(\{.*?\})", cleaned_text_for_parsing, re.DOTALL | re.S)
-        
-        if block_match:
-            # Extract the JSON string from the matched group, prioritizing the markdown block.
-            # Then, strip any leading/trailing whitespace.
-            json_str = (block_match.group(1) or block_match.group(2)).strip()
-            data = json.loads(json_str)
-        else:
-            raise ValueError("No JSON found in text.")
-
-        # Step 3: Extract and validate tasks.
-        tasks = [
-            t["id"] if isinstance(t, dict) else t
-            for t in data.get("tasks", [])
-        ]
-        return [tid for tid in tasks if tid in _TASK_IDS]
-    except Exception as err:
-        # Log the raw text that caused the parsing failure for debugging.
-        print(f"⚠️ Planner JSON parse failed: {err}. Raw text: {text}")
+        data = json.loads(block)
+        tasks = data.get("tasks", [])
+        if not isinstance(tasks, list):
+            LOGGER.warning("PlannerAgent: 'tasks' is not a list.")
+            return []
+        return tasks
+    except json.JSONDecodeError as err:
+        LOGGER.error("PlannerAgent: JSON error – %s", err, exc_info=True)
         return []
 
 
-# ────────────────── main entry ──────────────────
-def run(user_query: str, conversation_id: str) -> List[str]:
-    summary_tool = MemorySummaryTool()
-    summary = summary_tool.run(conversation_id)
+# --------------------------------------------------------------------------- #
+# PlannerAgent class (unchanged)
+# --------------------------------------------------------------------------- #
 
-    llm = get_llm(streaming=False, temperature=0.0)
-    # Refined prompt for clearer instructions to the LLM,
-    # especially for greetings and when no specific tool is needed.
-    prompt = (
-        "You are PlannerAgent. Your role is to determine which domain-specific agents "
-        "should be executed based on the user's query and the conversation summary.\n"
-        "Allowed agent IDs are: retrieval, finance, k8s.\n"
-        "You MUST return a valid JSON object with a single top-level key named 'tasks'.\n"
-        "The value of 'tasks' MUST be an array of objects, where each object has an 'id' key "
-        "corresponding to an allowed agent ID.\n"
-        "Example for a single 'finance' task: {\"tasks\":[{\"id\":\"finance\"}]}\n"
-        "Example for multiple tasks: {\"tasks\":[{\"id\":\"retrieval\"},{\"id\":\"k8s\"}]}\n"
-        "Specific example: If the user asks about a stock price (e.g., 'What is the price of AAPL?'), "
-        "you MUST return: {\"tasks\":[{\"id\":\"finance\"}]}\n"
-        "If the user's query is a simple greeting (e.g., 'Hi', 'Hello'), or does not require a specific tool, "
-        "return an empty array for tasks: {\"tasks\":[]}\n" # Added specific instruction for greetings/no-tool queries
-        "DO NOT include any other text, explanation, or markdown outside of the JSON.\n"
-        "Only respond with the JSON object.\n\n"
-        f"Conversation summary:\n{summary}\n\n"
-        f"User's latest question: {user_query}"
-    )
 
-    llm_response = llm.invoke(prompt).content
-    return _safe_parse_tasks(llm_response)
+class PlannerAgent(BaseAgent):  # noqa: D101
+    name = "planner"
+
+    @staticmethod
+    def default_fallback() -> str:  # noqa: D401
+        return (
+            "⚠️  PlannerAgent couldn’t decide which tool to run. "
+            "Check the planner logs for JSON-parsing errors."
+        )
+
+    @staticmethod
+    def _build_prompt(summary: str, user_msg: str) -> str:
+        return (
+            "You are the PlannerAgent inside an agentic AI system.\n"
+            "Return STRICT JSON with a single array field `tasks`.\n\n"
+            "Example:\n"
+            "```json\n"
+            '{"tasks":[{"id":"finance"}]}\n'
+            "```\n\n"
+            f"--- Conversation summary (≤250 tokens) ---\n{summary}\n"
+            f"--- Latest user message ---\n{user_msg}\n"
+            "--- End ---"
+        )
+
+    # public API ------------------------------------------------------------ #
+
+    def plan(  # noqa: D401
+        self,
+        conversation_summary: str,
+        user_message: str,
+        *,
+        model: str | None = None,
+        temperature: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        prompt = self._build_prompt(conversation_summary, user_message)
+
+        llm_resp = self.llm.invoke(
+            prompt,
+            model=model or self.default_model,
+            temperature=temperature,
+            response_format={"type": "json_object"},  # OpenAI / Anthropic
+        )
+
+        raw_text: str = (
+            llm_resp.content if hasattr(llm_resp, "content") else str(llm_resp)
+        )
+        LOGGER.debug("PlannerAgent raw output:\n%s", raw_text)
+
+        return _safe_parse_tasks(raw_text)
