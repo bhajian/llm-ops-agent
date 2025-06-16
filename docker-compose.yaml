@@ -1,14 +1,17 @@
-version: "3.8"
-
-# ──────────────────────────── Persistent volumes ──────────────────────────
+###############################################################################
+#                                   VOLUMES                                   #
+###############################################################################
 volumes:
   redis-data:
   weaviate-data:
 
-# ──────────────────────────────── Services ────────────────────────────────
+###############################################################################
+#                                   SERVICES                                  #
+###############################################################################
 services:
-
-# ── Key / value store ─────────────────────────────────────────────────────
+  ###########################################################################
+  # Redis – key/value store (chat memory, rate limits, …)                  #
+  ###########################################################################
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
@@ -21,17 +24,19 @@ services:
       timeout: 5s
       retries: 3
     ports:
-      - "6379:6379"            # expose to host as well
+      - "6379:6379"      # optional → expose to host for debugging
 
-# ── Vector DB (Weaviate) ──────────────────────────────────────────────────
+  ###########################################################################
+  # Weaviate – vector DB (NO server-side vectorizer, we embed in Python)    #
+  ###########################################################################
   weaviate:
     image: semitechnologies/weaviate:1.24.8
     environment:
-      QUERY_DEFAULTS_LIMIT:                          25
-      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED:      "true"
-      PERSISTENCE_DATA_PATH:                        "/var/lib/weaviate"
-      DEFAULT_VECTORIZER_MODULE:                    "none"     # we supply embeddings
-      ENABLE_MODULES:                               ""         # no server-side vectors
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: "none"        # we push our own vectors
+      ENABLE_MODULES: ""                       # disable built-in HF module
     volumes:
       - weaviate-data:/var/lib/weaviate
     restart: unless-stopped
@@ -47,13 +52,15 @@ services:
     ports:
       - "8080:8080"
 
-# ── FastAPI RAG / Agent stack ─────────────────────────────────────────────
+  ###########################################################################
+  # FastAPI “agent-server” – RAG, ingestion, auth                            #
+  ###########################################################################
   agent-server:
     build: .
     command: >
       uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
-      - ./:/app
+      - ./:/app                 # live-reload during dev
     restart: unless-stopped
     depends_on:
       redis:
@@ -63,49 +70,73 @@ services:
     ports:
       - "8000:8000"
 
+    # All secrets & run-time switches come from .env (docker-compose picks it
+    # up automatically).  Only service-internal addresses are hard-coded.
     environment:
-      # — LangSmith / tracing (unchanged) —
-      LANGCHAIN_TRACING_V2: "true"
-      LANGCHAIN_API_KEY:   "${LANGCHAIN_API_KEY}"
-      LANGCHAIN_PROJECT:   "${LANGCHAIN_PROJECT:-rag-stack}"
+      #######################################################################
+      # LangChain / tracing
+      #######################################################################
+      LANGCHAIN_TRACING_V2: "${LANGCHAIN_TRACING_V2}"
+      LANGCHAIN_API_KEY:    "${LANGCHAIN_API_KEY}"
+      LANGCHAIN_PROJECT:    "${LANGCHAIN_PROJECT:-rag-stack}"
 
-      # LLM + embeddings
-      LLM_BACKEND:           "${LLM_BACKEND}"              # openai  / bedrock / …
-      OPENAI_API_BASE:       "${OPENAI_API_BASE}"
-      OPENAI_API_KEY:        "${OPENAI_API_KEY}"
-      OPENAI_MODEL:          "${OPENAI_MODEL}"
-      EMBEDDING_BACKEND:     "${EMBEDDING_BACKEND:-hf}"    # hf / openai / local
+      #######################################################################
+      # Chat LLM (vLLM)  -------------------------------------------------- #
+      #######################################################################
+      LLM_BACKEND:  "${LLM_BACKEND:-vllm}"           # vllm / openai / bedrock …
+      VLLM_BASE:    "${VLLM_BASE}"                   # e.g. http://host:8000/v1
+      MODEL_NAME:   "${MODEL_NAME}"                  # meta-llama/Meta-Llama-3-8B-Instruct
+
+      #######################################################################
+      # Embeddings (OpenAI cloud)  ---------------------------------------- #
+      #######################################################################
+      EMBEDDING_BACKEND:  "${EMBEDDING_BACKEND:-openai}"
+      OPENAI_API_KEY:     "${OPENAI_API_KEY}"        # real key – *also* used by embeddings
+      OPENAI_EMBED_BASE:  "${OPENAI_EMBED_BASE:-https://api.openai.com/v1}"
+      OPENAI_EMBED_MODEL: "${OPENAI_EMBED_MODEL:-text-embedding-3-small}"
+
+      #######################################################################
+      # (Optional) HuggingFace fallback – kept here for completeness
+      #######################################################################
       HF_EMBED_MODEL:        "${HF_EMBED_MODEL}"
-      OPENAI_EMBED_MODEL:    "${OPENAI_EMBED_MODEL:-text-embedding-3-small}"
       HUGGINGFACE_HUB_TOKEN: "${HUGGINGFACE_HUB_TOKEN}"
 
-      # ===== Bedrock =====
-      AWS_ACCESS_KEY_ID:     "${AWS_ACCESS_KEY_ID}"
-      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
-      AWS_REGION:            "${AWS_REGION:-us-east-1}"
-      BEDROCK_REGION:        "${BEDROCK_REGION:-us-east-1}"
-      BEDROCK_MODEL_ID:      "${BEDROCK_MODEL_ID}"
-      BEDROCK_EMBED_MODEL:   "${BEDROCK_EMBED_MODEL}"
+      #######################################################################
+      # Bedrock (inactive, but envs kept for easy switch)
+      #######################################################################
+      AWS_ACCESS_KEY_ID:       "${AWS_ACCESS_KEY_ID}"
+      AWS_SECRET_ACCESS_KEY:   "${AWS_SECRET_ACCESS_KEY}"
+      AWS_REGION:              "${AWS_REGION:-us-east-1}"
+      BEDROCK_REGION:          "${BEDROCK_REGION:-us-east-1}"
+      BEDROCK_MODEL_ID:        "${BEDROCK_MODEL_ID}"
+      BEDROCK_EMBED_MODEL:     "${BEDROCK_EMBED_MODEL}"
 
-      # — In-cluster addresses —
-      REDIS_HOST:    "redis"
-      WEAVIATE_URL:  "http://weaviate:8080"
+      #######################################################################
+      # In-cluster service addresses
+      #######################################################################
+      REDIS_HOST:   "redis"
+      WEAVIATE_URL: "http://weaviate:8080"
 
-      # — Auth for API & UI —
-      ADMIN_TOKEN:   "${ADMIN_TOKEN}"
-      USER_TOKEN:    "${USER_TOKEN}"
+      #######################################################################
+      # REST / UI auth
+      #######################################################################
+      ADMIN_TOKEN: "${ADMIN_TOKEN}"
+      USER_TOKEN:  "${USER_TOKEN}"
 
-# ── Streamlit UI ──────────────────────────────────────────────────────────
+  ###########################################################################
+  # Streamlit UI                                                           #
+  ###########################################################################
   ui:
     build: ./ui
     volumes:
       - ./ui:/app
     environment:
-      BACKEND_URL:  "http://agent-server:8000"
-      AUTH_TOKEN:   "${ADMIN_TOKEN:-supersecrettoken}"
+      BACKEND_URL: "http://agent-server:8000"
+      AUTH_TOKEN:  "${ADMIN_TOKEN:-supersecrettoken}"
       STREAMLIT_SERVER_RUN_ON_SAVE: "true"
     depends_on:
       agent-server:
         condition: service_started
     ports:
       - "8501:8501"
+      

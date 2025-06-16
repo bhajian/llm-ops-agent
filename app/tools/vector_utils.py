@@ -24,6 +24,10 @@ from weaviate import Client as WeaviateClient
 
 from app.llm import get_embeddings
 
+import logging
+logging.basicConfig(level=logging.DEBUG)
+log = logging.getLogger(__name__)
+
 
 # ────────────────────────── Weaviate connection ──────────────────────────
 def _connect_weaviate() -> WeaviateClient:
@@ -70,29 +74,57 @@ def _load_and_split(path: str | Path) -> List[Document]:
 
 
 # ───────────────────────── public ingest helper ──────────────────────────
-def ingest_file_to_weaviate(path: str | Path) -> int:
+def ingest_file_to_weaviate(path: Union[str, Path]) -> int:
     """
-    Main function used by the /ingest endpoint.
-    Returns *number of chunks* inserted.
+    Load → split → embed → upsert.
+    Returns the number of chunks written, *0* on empty files.
+    Raises *RuntimeError* on any unexpected failure (so FastAPI turns it into 500).
     """
-    docs = _load_and_split(path)
-    if not docs:
+    path = Path(path)
+    log.info("📥  Ingest started: %s", path)
+
+    # ------------------------------------------------------------------ 1) load + split
+    try:
+        docs: List = _load_and_split(path)
+        log.info("📝  %s → %d chunks", path.name, len(docs))
+    except Exception as err:
+        log.exception("❌  Failed during load/split")
+        raise RuntimeError(f"load/split failed for {path}: {err}") from err
+
+    if not docs:                     # empty PDF / TXT
+        log.warning("⚠️  No text extracted from %s – skipping", path)
         return 0
 
-    # enrich with a simple `source` meta-field
-    for d in docs:
-        d.metadata["source"] = Path(path).name
+    for d in docs:                   # tiny enrichment
+        d.metadata["source"] = path.name
 
-    embed = get_embeddings()                     # OpenAI or HF
-    client = _connect_weaviate()
+    # ------------------------------------------------------------------ 2) embeddings client
+    try:
+        embed = get_embeddings()
+    except Exception as err:
+        log.exception("❌  Could not initialise embeddings backend")
+        raise RuntimeError(f"embedding backend error: {err}") from err
 
-    vs = WeaviateVectorStore(
-        client=client,
-        embedding=embed,            # => vectors are supplied client-side
-        index_name="Document",
-        text_key="text",            # where the raw chunk is stored
-        by_text=False,              # store the vectors directly
-    )
+    # ------------------------------------------------------------------ 3) weaviate connection
+    try:
+        client = _connect_weaviate()
+    except Exception as err:
+        log.exception("❌  Could not connect to Weaviate")
+        raise RuntimeError(f"weaviate connection error: {err}") from err
 
-    vs.add_documents(docs)
-    return len(docs)
+    # ------------------------------------------------------------------ 4) upsert
+    try:
+        vs = WeaviateVectorStore(
+            client=client,
+            embedding=embed,
+            index_name="Document",
+            text_key="text",
+            by_text=False,
+        )
+        vs.add_documents(docs)
+        log.info("✅  Successfully ingested %d chunks from %s", len(docs), path)
+        return len(docs)
+
+    except Exception as err:
+        log.exception("❌  Failed during upsert")
+        raise RuntimeError(f"vector-store upsert failed: {err}") from err

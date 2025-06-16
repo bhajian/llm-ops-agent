@@ -1,111 +1,177 @@
-# app/llm.py
 """
-LLM / Embedding factory helpers
+Generic LLM / Embedding factory
 ────────────────────────────────
+Chat LLM
+────────
+  LLM_BACKEND = openai | vllm | bedrock            (default: openai)
+  MODEL_NAME  = meta-llama/Meta-Llama-3-8B-Instruct
+
+  OPENAI_API_BASE … OpenAI cloud   (chat)
+  VLLM_BASE        … vLLM endpoint (chat or embeds)
+  BEDROCK_REGION   … us‑east‑1 …
+  OPENAI_API_KEY   … required syntactically for every OpenAI‑style client
+  AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY … for Bedrock
+
 Embeddings
-  • Hugging Face sentence-transformers  (EMBEDDING_BACKEND=hf)
-  • OpenAI /text-embedding-3            (EMBEDDING_BACKEND=openai)
-  • Local mean-pool stub                (EMBEDDING_BACKEND=local)
+──────────
+  EMBEDDING_BACKEND = openai | vllm | hf           (default: openai)
 
-LLMs
-  • Any OpenAI-compatible chat endpoint (OpenAI, vLLM, llama.cpp, Bedrock)
+  OPENAI_EMBED_MODEL = text-embedding-3-small
+  OPENAI_EMBED_BASE  = <url>  (falls back to OPENAI_API_BASE)
 
-Agents import `chat_llm(messages)`.
+  HF_EMBED_MODEL = sentence-transformers/all-MiniLM-L6-v2
 """
 from __future__ import annotations
-import os, inspect, asyncio
+
+import os
+import inspect
 from functools import lru_cache
-from typing import List, Dict, Literal, Optional
+from typing import Dict, Literal, List, Optional
 
 from dotenv import load_dotenv
+
 load_dotenv(override=False)
 
-# ───────────────────────────  Embeddings  ───────────────────────────
-_EmbedBackend = Literal["hf", "openai", "local"]
+##############################################################################
+# Helpers
+##############################################################################
 
-# Hugging Face ------------------------------------------------------
-from langchain_huggingface import HuggingFaceEmbeddings
-from huggingface_hub import login as _hf_login
+def _norm_base(url: str) -> str:
+    """strip trailing / and a possible *duplicate* /v1 suffix"""
+    url = url.rstrip("/")
+    if url.lower().endswith("/v1"):
+        url = url[:-3]  # drop the /v1
+    return url
 
-if tok := os.getenv("HUGGINGFACE_HUB_TOKEN"):
-    # avoid `git` dependency inside slim image
-    _hf_login(tok, add_to_git_credential=False)
-
-def _hf_embed(model_name: str):
-    return HuggingFaceEmbeddings(model_name=model_name)
-
-# OpenAI ------------------------------------------------------------
+##############################################################################
+# ────────────────────────────  EMBEDDINGS  ──────────────────────────────── #
+##############################################################################
 from langchain_openai import OpenAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 
-def _openai_embed(model_name: str):
+
+def _openai_embeddings() -> OpenAIEmbeddings:
+    base_url = _norm_base(
+        os.getenv("OPENAI_EMBED_BASE", os.getenv("OPENAI_API_BASE", "https://api.openai.com"))
+    )
     return OpenAIEmbeddings(
-        base_url=os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1"),
-        api_key=os.getenv("OPENAI_API_KEY"),
-        model=model_name,
+        model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+        base_url=f"{base_url}/v1",
+        api_key=os.getenv("OPENAI_API_KEY", "dummy"),
     )
 
-# Local stub (mean-pool) -------------------------------------------
-class _MeanPoolEmbeddings:
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return [[float(hash(t) % 1000)] for t in texts]
-    def embed_query(self, text: str) -> List[float]:
-        return [float(hash(text) % 1000)]
 
-def _local_embed(_: str):
-    return _MeanPoolEmbeddings()
-
-def get_embeddings(model_name: Optional[str] = None):
-    backend: _EmbedBackend = os.getenv("EMBEDDING_BACKEND", "hf").lower()
-    if backend == "hf":
-        model = model_name or os.getenv("HF_EMBED_MODEL",
-                                        "sentence-transformers/all-MiniLM-L6-v2")
-        return _hf_embed(model)
-    if backend == "openai":
-        model = model_name or os.getenv("OPENAI_EMBED_MODEL",
-                                        "text-embedding-3-small")
-        return _openai_embed(model)
-    return _local_embed("")
+def _vllm_embeddings() -> OpenAIEmbeddings:
+    base_url = _norm_base(os.getenv("VLLM_BASE", "http://localhost:8000"))
+    return OpenAIEmbeddings(
+        model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+        base_url=f"{base_url}/v1",
+        api_key="dummy",
+    )
 
 
-# ─────────────────────────────  LLMs  ──────────────────────────────
+def _hf_embeddings() -> HuggingFaceEmbeddings:
+    return HuggingFaceEmbeddings(
+        model_name=os.getenv("HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    )
+
+
+_EMBED_BACKENDS: Dict[str, callable] = {
+    "openai": _openai_embeddings,
+    "vllm": _vllm_embeddings,
+    "hf": _hf_embeddings,
+}
+
+
+def get_embeddings():
+    backend = os.getenv("EMBEDDING_BACKEND", "openai").lower()
+    try:
+        return _EMBED_BACKENDS[backend]()
+    except KeyError as exc:  # pragma: no cover
+        raise ValueError(f"Unsupported EMBEDDING_BACKEND={backend!r}") from exc
+
+
+##############################################################################
+# ───────────────────────────────  CHAT  LLM  ────────────────────────────── #
+##############################################################################
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
-_BackendT = Literal["openai"]
+_BackendT = Literal["openai", "vllm", "bedrock"]
+
 
 def _openai_llm(temp: float, max_tokens: int, streaming: bool):
+    base = _norm_base(os.getenv("OPENAI_API_BASE", "https://api.openai.com"))
     return ChatOpenAI(
-        base_url=os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1"),
+        base_url=f"{base}/v1",
         api_key=os.getenv("OPENAI_API_KEY"),
-        model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+        model=os.getenv("MODEL_NAME", "gpt-3.5-turbo"),
         temperature=temp,
         max_tokens=max_tokens,
         streaming=streaming,
     )
 
-_BACKENDS: dict[_BackendT, callable] = {"openai": _openai_llm}
+
+def _vllm_llm(temp: float, max_tokens: int, streaming: bool):
+    base = _norm_base(os.getenv("VLLM_BASE", "http://localhost:8000"))
+    return ChatOpenAI(
+        base_url=f"{base}/v1",
+        api_key="dummy",  # vLLM ignores auth
+        model=os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct"),
+        temperature=temp,
+        max_tokens=max_tokens,
+        streaming=streaming,
+    )
+
+
+def _bedrock_llm(temp: float, max_tokens: int, streaming: bool):
+    try:
+        from langchain_aws import ChatBedrock
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError("pip install langchain-aws to use Bedrock backend") from e
+
+    return ChatBedrock(
+        model_id=os.getenv("MODEL_NAME", "anthropic.claude-3-sonnet-20240229-v1:0"),
+        region_name=os.getenv("BEDROCK_REGION", os.getenv("AWS_REGION", "us-east-1")),
+        streaming=streaming,
+        model_kwargs={"temperature": temp, "max_tokens": max_tokens},
+    )
+
+
+_LLM_BACKENDS: Dict[_BackendT, callable] = {
+    "openai": _openai_llm,
+    "vllm": _vllm_llm,
+    "bedrock": _bedrock_llm,
+}
+
 
 @lru_cache(maxsize=None)
-def get_llm(temperature=0.2, max_tokens=1024, streaming=True):
-    backend: _BackendT = os.getenv("LLM_BACKEND", "openai").lower()
-    return _BACKENDS[backend](temperature, max_tokens, streaming)
+def get_llm(temperature: float = 0.2, max_tokens: int = 1024, streaming: bool = True):
+    backend: _BackendT = os.getenv("LLM_BACKEND", "openai").lower()  # default
+    try:
+        return _LLM_BACKENDS[backend](temperature, max_tokens, streaming)
+    except KeyError as exc:  # pragma: no cover
+        raise ValueError(f"Unsupported LLM_BACKEND={backend!r}") from exc
 
 
-# ─────────────────────  async chat wrapper  ────────────────────────
-def _dict2msg(d: Dict[str, str]):
-    role, content = d["role"], d.get("content") or d.get("msg", "")
-    if role == "user":      return HumanMessage(content)
-    if role == "assistant": return AIMessage(content)
-    return SystemMessage(content)
+##############################################################################
+# ──────────────────  LIGHT‑WEIGHT async chat convenience  ───────────────── #
+##############################################################################
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
-async def _default_chat_llm(messages: List[Dict[str, str]]) -> str:
-    llm_msgs = [_dict2msg(m) for m in messages]
-    llm = get_llm(streaming=False)
-    res = await llm.ainvoke(llm_msgs)
-    return res.content.strip()
 
-_chat_fn = globals().get("chat_llm", _default_chat_llm)
+def _dict2lc(m: Dict[str, str]):
+    role = m["role"]
+    content = m.get("content", m.get("msg", ""))
+    if role == "user":
+        return HumanMessage(content)
+    if role == "assistant":
+        return AIMessage(content)
+    return SystemMessage(content)  # treat anything else as system
+
 
 async def chat_llm(messages: List[Dict[str, str]]) -> str:
-    out = _chat_fn(messages)
-    return await out if inspect.isawaitable(out) else out
+    """Async helper used by agents – converts plain dicts → LC messages."""
+    lc_msgs = [_dict2lc(m) for m in messages]
+    llm = get_llm(streaming=False)
+    result = await llm.ainvoke(lc_msgs)
+    return result.content.strip()
