@@ -1,116 +1,111 @@
-# ────────────── Named volumes (persistent) ──────────────
-volumes:
-  redis-data: 
-  weaviate-data: 
+version: "3.8"
 
+# ──────────────────────────── Persistent volumes ──────────────────────────
+volumes:
+  redis-data:
+  weaviate-data:
+
+# ──────────────────────────────── Services ────────────────────────────────
 services:
-# ────────────── DATA LAYER ──────────────
+
+# ── Key / value store ─────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
     volumes:
-      - ./data/redis:/data
+      - redis-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
       interval: 10s
       timeout: 5s
       retries: 3
-    ports: ["6379:6379"]        # ← host-level access (optional)
-    expose: ["6379"]            # internal network (redundant if ports above)
+    ports:
+      - "6379:6379"            # expose to host as well
 
+# ── Vector DB (Weaviate) ──────────────────────────────────────────────────
   weaviate:
     image: semitechnologies/weaviate:1.24.8
     environment:
-      QUERY_DEFAULTS_LIMIT: 25
-      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
-      DEFAULT_VECTORIZER_MODULE: text2vec-openai
-      ENABLE_MODULES: text2vec-openai,text2vec-huggingface
-      OPENAI_APIKEY: ${OPENAI_API_KEY:-}
+      QUERY_DEFAULTS_LIMIT:                          25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED:      "true"
+      PERSISTENCE_DATA_PATH:                        "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE:                    "none"     # we supply embeddings
+      ENABLE_MODULES:                               ""         # no server-side vectors
     volumes:
-      - ./data/weaviate:/var/lib/weaviate
+      - weaviate-data:/var/lib/weaviate
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
-    expose: ["8080"]             # internal use
-    ports: ["8080:8080"]         # reach Weaviate from host if needed
-
-# ────────────── MCP SERVERS ──────────────
-  mcp-openshift:
-    build: ./mcp-openshift
-    environment:
-      MCP_USERNAME: ${MCP_USERNAME:-admin}
-      MCP_PASSWORD: ${MCP_PASSWORD:-secret}
-      KUBECONFIG: /app/.kube/config
-      PORT: 9000
-    expose: ["9000"]             # only agent needs this
-    ports: ["9101:9000"]         # expose to host (optional)
-    restart: unless-stopped
-
-  mcp-fmp:
-    build: ./mcp-fmp
-    environment:
-      PORT: 5000
-      FMP_API_KEY: ${FMP_API_KEY}
-    expose: ["5000"]             # agent uses this internally
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "-", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     ports:
-      - "${HOST_PORT:-9100}:5000"  # host access → localhost:9100
-    restart: unless-stopped
+      - "8080:8080"
 
-# ────────────── AGENT (FastAPI + RAG) ──────────────
+# ── FastAPI RAG / Agent stack ─────────────────────────────────────────────
   agent-server:
     build: .
-    environment:
-      - LANGCHAIN_TRACING_V2=true
-      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
-      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
-      - BEDROCK_REGION=${BEDROCK_REGION}
-      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND} # CORRECTED LINE
-      # - HUGGINGFACE_HUB_TOKEN: ${HUGGINGFACE_HUB_TOKEN:-admin}
-      - LLM_BACKEND=${LLM_BACKEND:-bedrock} # CORRECTED FOR CONSISTENCY
-      - LLM_BASE_URL=${LLM_BASE_URL:-} # CORRECTED FOR CONSISTENCY
-      - LLM_MODEL=${LLM_MODEL} # CORRECTED FOR CONSISTENCY
-      # - EMBEDDING_MODEL=${EMBEDDING_MODEL} # CORRECTED FOR CONSISTENCY
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-} # CORRECTED FOR CONSISTENCY
-      - BEDROCK_EMBED_MODEL=${BEDROCK_EMBED_MODEL}
-      - REDIS_HOST=redis # CORRECTED FOR CONSISTENCY
-      - WEAVIATE_URL=http://weaviate:8080 # CORRECTED FOR CONSISTENCY
-      - FMP_FASTAPI_URL=http://mcp-fmp:5000 # CORRECTED FOR CONSISTENCY
-      - MCP_K8S_URL=http://mcp-openshift:9000 # CORRECTED FOR CONSISTENCY
-      - MCP_USERNAME=${MCP_USERNAME:-admin} # CORRECTED FOR CONSISTENCY
-      - MCP_PASSWORD=${MCP_PASSWORD:-secret} # CORRECTED FOR CONSISTENCY
-      - ADMIN_TOKEN=${ADMIN_TOKEN:-supersecrettoken} # CORRECTED FOR CONSISTENCY
-
-    volumes:
-      - ./:/app
     command: >
       uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./:/app
     restart: unless-stopped
     depends_on:
+      redis:
+        condition: service_healthy
       weaviate:
-        condition: service_started
-      mcp-openshift:
-        condition: service_started
-      mcp-fmp:
-        condition: service_started
-    expose: ["8000"]             # internal (ui)
-    ports: ["8000:8000"]         # host access for API
+        condition: service_healthy
+    ports:
+      - "8000:8000"
 
-# ────────────── SIMPLE STREAMLIT UI ──────────────
+    environment:
+      # — LangSmith / tracing (unchanged) —
+      LANGCHAIN_TRACING_V2: "true"
+      LANGCHAIN_API_KEY:   "${LANGCHAIN_API_KEY}"
+      LANGCHAIN_PROJECT:   "${LANGCHAIN_PROJECT:-rag-stack}"
+
+      # LLM + embeddings
+      LLM_BACKEND:           "${LLM_BACKEND}"              # openai  / bedrock / …
+      OPENAI_API_BASE:       "${OPENAI_API_BASE}"
+      OPENAI_API_KEY:        "${OPENAI_API_KEY}"
+      OPENAI_MODEL:          "${OPENAI_MODEL}"
+      EMBEDDING_BACKEND:     "${EMBEDDING_BACKEND:-hf}"    # hf / openai / local
+      HF_EMBED_MODEL:        "${HF_EMBED_MODEL}"
+      OPENAI_EMBED_MODEL:    "${OPENAI_EMBED_MODEL:-text-embedding-3-small}"
+      HUGGINGFACE_HUB_TOKEN: "${HUGGINGFACE_HUB_TOKEN}"
+
+      # ===== Bedrock =====
+      AWS_ACCESS_KEY_ID:     "${AWS_ACCESS_KEY_ID}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
+      AWS_REGION:            "${AWS_REGION:-us-east-1}"
+      BEDROCK_REGION:        "${BEDROCK_REGION:-us-east-1}"
+      BEDROCK_MODEL_ID:      "${BEDROCK_MODEL_ID}"
+      BEDROCK_EMBED_MODEL:   "${BEDROCK_EMBED_MODEL}"
+
+      # — In-cluster addresses —
+      REDIS_HOST:    "redis"
+      WEAVIATE_URL:  "http://weaviate:8080"
+
+      # — Auth for API & UI —
+      ADMIN_TOKEN:   "${ADMIN_TOKEN}"
+      USER_TOKEN:    "${USER_TOKEN}"
+
+# ── Streamlit UI ──────────────────────────────────────────────────────────
   ui:
     build: ./ui
-    environment:
-      BACKEND_URL: http://agent-server:8000
-      AUTH_TOKEN:  ${ADMIN_TOKEN:-supersecrettoken}
-      STREAMLIT_SERVER_RUNONSAVE: "true"
     volumes:
       - ./ui:/app
+    environment:
+      BACKEND_URL:  "http://agent-server:8000"
+      AUTH_TOKEN:   "${ADMIN_TOKEN:-supersecrettoken}"
+      STREAMLIT_SERVER_RUN_ON_SAVE: "true"
     depends_on:
       agent-server:
         condition: service_started
-    ports: ["8501:8501"]         # expose UI to host
-    
+    ports:
+      - "8501:8501"
