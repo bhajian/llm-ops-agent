@@ -8,59 +8,51 @@ from fastapi import FastAPI, Depends, Request, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain.callbacks.base import AsyncCallbackHandler
 
-# --- IMPORTS ---
+# --- INTERNAL IMPORTS ---
 from app.auth import verify_token
-from app.memory import load_chat, save_chat, _r
-from app.agent_router import route_query # <--- THIS IS THE ONLY ROUTER IMPORT NOW
-from app.tools.vector_utils import ingest_file_to_weaviate # For ingest endpoint
+from app.memory import load_chat, _r               # save_chat now handled inside agent
+from app.agent_router import run_agentic_chat      # new orchestrator
+from app.tools.vector_utils import ingest_file_to_weaviate
 
 app = FastAPI()
 
+
 # ─────────────────────────────────────────────────────────────
-# Helper to check for initial chat trigger phrases
+# Helper: detect a brand-new chat
+# ─────────────────────────────────────────────────────────────
 def _is_initial_chat_trigger(query: str, chat_id: str) -> bool:
     """
-    Checks if the query indicates a new chat session and there's no existing history.
+    True if the user sent an empty / greeting message AND no history exists.
     """
-    normalized_query = query.lower().strip()
-    # Check for empty query or common greeting phrases
-    if not normalized_query or normalized_query in ["start chat", "hello", "hi", "hey", "help"]:
-        # Only consider it an initial trigger if chat history for this ID is empty
+    normalized = query.lower().strip()
+    if not normalized or normalized in {"start chat", "hello", "hi", "hey", "help"}:
         return not load_chat(chat_id)
     return False
 
+
 # ─────────────────────────────────────────────────────────────
-# /chat  (non-stream) - REFACTORED
+# /chat  – blocking JSON
 # ─────────────────────────────────────────────────────────────
 @app.post("/chat")
 async def chat(req: Request, user: str = Depends(verify_token)):
-    body = await req.json()
-    query = body.get("query", "")
-    cid = body.get("chat_id", user)
+    body   = await req.json()
+    query  = body.get("query", "")
+    chat_id = body.get("chat_id", user)
 
-    print(f"💬 /chat received query: '{query}' for chat_id: '{cid}'")
+    print(f"💬 /chat → '{query}' (chat_id={chat_id})")
 
-    # 1. Handle initial empty query or specific start phrases with a static welcome message
-    if _is_initial_chat_trigger(query, cid):
-        welcome_message = "Hello! How can I help you today?"
-        print(f"✅ Returning static welcome message for new chat or initial greeting.")
-        return JSONResponse({"response": welcome_message, "chat_id": cid})
+    # Greeting / new-thread shortcut
+    if _is_initial_chat_trigger(query, chat_id):
+        return JSONResponse({"response": "Hello! How can I help you today?",
+                             "chat_id": chat_id})
 
-    # 2. Load history (only if not an initial empty query handled above)
-    history = load_chat(cid)
+    # Delegate to the autonomous agent (handles memory internally)
+    answer = await run_agentic_chat(query, chat_id)
+    return JSONResponse({"response": answer, "chat_id": chat_id})
 
-    # 3. Delegate EVERYTHING to the agent router.
-    answer = await route_query(query, history, cid) 
-
-    print(f"✅ Router returned answer: {answer}")
-
-    # 4. Save the final answer
-    save_chat(cid, query, answer) 
-
-    return JSONResponse({"response": answer, "chat_id": cid})
 
 # ─────────────────────────────────────────────────────────────
-# token buffer for streaming mode
+# Token buffer (kept for future real-time streaming)
 # ─────────────────────────────────────────────────────────────
 class _TokenBuffer(AsyncCallbackHandler):
     def __init__(self):
@@ -79,38 +71,35 @@ class _TokenBuffer(AsyncCallbackHandler):
                 break
             yield tok
 
+
 # ─────────────────────────────────────────────────────────────
-# /chat/stream (streams all answers that support it) - REFACTORED
+# /chat/stream  – Server-Sent Events lite
 # ─────────────────────────────────────────────────────────────
 @app.post("/chat/stream")
 async def chat_stream(req: Request, user: str = Depends(verify_token)):
-    body = await req.json()
-    query = body.get("query", "")
-    cid = body.get("chat_id", user)
-    
-    print(f"💬 /chat/stream received query: '{query}' for chat_id: '{cid}'")
+    body   = await req.json()
+    query  = body.get("query", "")
+    chat_id = body.get("chat_id", user)
 
-    # 1. Handle initial empty query or specific start phrases with a static welcome message
-    if _is_initial_chat_trigger(query, cid):
-        welcome_message = "Hello! How can I help you today?"
-        async def welcome_stream():
-            yield welcome_message
-        print(f"✅ Returning static welcome message stream for new chat or initial greeting.")
-        return StreamingResponse(welcome_stream(), media_type="text/plain")
+    print(f"💬 /chat/stream → '{query}' (chat_id={chat_id})")
 
-    history = load_chat(cid)
+    # Greeting / new-thread shortcut
+    if _is_initial_chat_trigger(query, chat_id):
+        async def _greet_stream():
+            yield "Hello! How can I help you today?"
+        return StreamingResponse(_greet_stream(), media_type="text/plain")
 
-    answer = await route_query(query, history, cid)
-    save_chat(cid, query, answer)
+    answer = await run_agentic_chat(query, chat_id)
 
-    async def once():
+    async def _once():
         yield answer
-    return StreamingResponse(once(), media_type="text/plain")
+    return StreamingResponse(_once(), media_type="text/plain")
+
 
 # ─────────────────────────────────────────────────────────────
-# /ingest (PDF / TXT → Weaviate) - (No changes needed)
+# /ingest  – PDF/TXT → Weaviate
 # ─────────────────────────────────────────────────────────────
-def ingest_files(paths: List[str]) -> int:
+def _ingest_files(paths: List[str]) -> int:
     return sum(ingest_file_to_weaviate(p) for p in paths)
 
 @app.post("/ingest")
@@ -121,7 +110,7 @@ async def ingest(file: UploadFile = File(...), user: str = Depends(verify_token)
         tmp_path = tmp.name
 
     try:
-        n_chunks = ingest_files([tmp_path])
+        n_chunks = _ingest_files([tmp_path])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -129,13 +118,14 @@ async def ingest(file: UploadFile = File(...), user: str = Depends(verify_token)
 
     return {"message": f"Ingested {n_chunks} chunks 👍"}
 
+
 # ─────────────────────────────────────────────────────────────
-# /history endpoints - (No changes needed)
+# /history  – CRUD helpers
 # ─────────────────────────────────────────────────────────────
 @app.get("/history/{chat_id}")
 async def get_history(chat_id: str, user: str = Depends(verify_token)):
     raw = load_chat(chat_id)
-    sanitized = [{"role": m["role"], "content": m["content"]} for m in raw]
+    sanitized = [{"role": m["role"], "content": m["msg"]} for m in raw]
     return {"chat_id": chat_id, "history": sanitized}
 
 @app.get("/history/list")

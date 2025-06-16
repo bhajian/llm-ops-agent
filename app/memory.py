@@ -1,42 +1,55 @@
-# app/memory.py
+"""
+app/memory.py
+──────────────────────────────────────────────────────────────
+Unified memory layer.
 
-import json
-import redis
-from typing import List, Dict, Any, Optional
-from app.config import get_settings
+• save_chat   – async  (used by the agent core)
+• load_recent – async  (used by reasoner for context)
+• load_chat   – sync   (needed by old /history & greeting logic)
 
-_cfg = get_settings()
+Both helpers talk to the same Redis instance but with different
+clients so we don’t block the event loop.
+"""
+from __future__ import annotations
+import json, os
+from typing import List, Dict
 
-_r = redis.Redis(
-    host=_cfg["redis_host"],
-    port=_cfg["redis_port"],
-    db=_cfg["redis_db"],
-    decode_responses=True
-)
+import redis                          # blocking client
+import redis.asyncio as aredis        # asyncio client
 
-_KEY = "chat:{}"  # Redis key pattern
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
-def load_chat(cid: str) -> List[Dict[str, Any]]:
-    raw = _r.get(_KEY.format(cid))
-    return json.loads(raw) if raw else []
+# two connections, same DB
+_r_sync = redis.from_url(REDIS_URL, decode_responses=True)
+_r_async = aredis.from_url(REDIS_URL, decode_responses=True)
 
-def save_chat(cid: str, user_msg: str, assistant_msg: str, scratch: Optional[str] = None):
-    """
-    Appends user/assistant messages to chat history and persists to Redis.
-    `scratch` stores CoT/logits/internal info (never shown to user).
-    """
-    hist = load_chat(cid)
-    hist.append({"role": "user", "content": user_msg})
-    hist.append({"role": "assistant", "content": assistant_msg, "scratch": scratch})
-    _r.set(_KEY.format(cid), json.dumps(hist), ex=_cfg["redis_ttl"])
+CHAT_KEY = lambda cid: f"chat:{cid}"
 
-def format_chat_history(history: List[Dict[str, Any]], limit: int = 10) -> str:
-    """
-    Returns a printable string from recent messages.
-    Omits scratch/debug fields.
-    """
-    return "\n".join(
-        f"{m['role'].title()}: {m['content']}"
-        for m in history[-limit:]
-        if m.get("content")
+
+# ─────────────────────────────────────────────────────────────
+# async helpers (agentic core)
+# ─────────────────────────────────────────────────────────────
+async def save_chat(cid: str, user: str, assistant: str) -> None:
+    await _r_async.rpush(
+        CHAT_KEY(cid),
+        json.dumps({"role": "user", "msg": user}),
+        json.dumps({"role": "assistant", "msg": assistant}),
     )
+
+
+async def load_recent(cid: str, k: int = 12) -> List[Dict[str, str]]:
+    raw = await _r_async.lrange(CHAT_KEY(cid), -2 * k, -1)
+    return [json.loads(x) for x in raw]
+
+
+# ─────────────────────────────────────────────────────────────
+# sync helper for backwards-compat routes/UI
+# ─────────────────────────────────────────────────────────────
+def load_chat(cid: str) -> List[Dict[str, str]]:
+    raw = _r_sync.lrange(CHAT_KEY(cid), 0, -1)
+    return [json.loads(x) for x in raw]
+
+
+# Expose the blocking client under the old name so
+# /history/list continues to work unchanged.
+_r = _r_sync
