@@ -1,55 +1,65 @@
+# app/memory.py
 """
-app/memory.py
-──────────────────────────────────────────────────────────────
-Unified memory layer.
-
-• save_chat   – async  (used by the agent core)
-• load_recent – async  (used by reasoner for context)
-• load_chat   – sync   (needed by old /history & greeting logic)
-
-Both helpers talk to the same Redis instance but with different
-clients so we don’t block the event loop.
+Unified memory helper (sync + async)
+────────────────────────────────────
+• New preferred call:   await save_chat(cid, role="user", msg="Hi")
+• Old pair style still works: await save_chat(cid, "Hi", "Hello")
+• load_recent / load_chat unchanged
 """
 from __future__ import annotations
-import json, os
+import json, os, inspect
 from typing import List, Dict
 
-import redis                          # blocking client
-import redis.asyncio as aredis        # asyncio client
+import redis
+import redis.asyncio as aredis
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-
-# two connections, same DB
-_r_sync = redis.from_url(REDIS_URL, decode_responses=True)
-_r_async = aredis.from_url(REDIS_URL, decode_responses=True)
-
-CHAT_KEY = lambda cid: f"chat:{cid}"
+REDIS_URL   = os.getenv("REDIS_URL", "redis://redis:6379/0")
+_r_sync     = redis.from_url(REDIS_URL, decode_responses=True)
+_r_async    = aredis.from_url(REDIS_URL, decode_responses=True)
+CHAT_KEY    = lambda cid: f"chat:{cid}"
 
 
-# ─────────────────────────────────────────────────────────────
-# async helpers (agentic core)
-# ─────────────────────────────────────────────────────────────
-async def save_chat(cid: str, user: str, assistant: str) -> None:
-    await _r_async.rpush(
-        CHAT_KEY(cid),
-        json.dumps({"role": "user", "msg": user}),
-        json.dumps({"role": "assistant", "msg": assistant}),
+# ─────────────────────────────── save helpers ──────────────────────────────
+async def _push(cid: str, role: str, msg: str) -> None:
+    """Internal: append a single turn."""
+    await _r_async.rpush(CHAT_KEY(cid), json.dumps({"role": role, "msg": msg}))
+
+
+async def save_chat(cid: str, *args, **kw) -> None:
+    """
+    Flexible saver:
+
+    • NEW  → await save_chat(cid, role="user", msg="Hi")
+    • OLD  → await save_chat(cid, "Hi", "Hello")
+             (user-msg first, assistant-msg second)
+    """
+    # --- new keyword style -------------------------------------------------
+    if "role" in kw and "msg" in kw:
+        await _push(cid, kw["role"], kw["msg"])
+        return
+
+    # --- legacy two-arg style ---------------------------------------------
+    if len(args) == 2:
+        user, assistant = args          # type: ignore
+        await _push(cid, "user", user)
+        await _push(cid, "assistant", assistant)
+        return
+
+    raise TypeError(
+        "save_chat() expects (cid, role=…, msg=…)  or  (cid, user, assistant)"
     )
 
 
+# ───────────────────────── recent / full history ──────────────────────────
 async def load_recent(cid: str, k: int = 12) -> List[Dict[str, str]]:
-    raw = await _r_async.lrange(CHAT_KEY(cid), -2 * k, -1)
+    raw = await _r_async.lrange(CHAT_KEY(cid), -k, -1)
     return [json.loads(x) for x in raw]
 
 
-# ─────────────────────────────────────────────────────────────
-# sync helper for backwards-compat routes/UI
-# ─────────────────────────────────────────────────────────────
 def load_chat(cid: str) -> List[Dict[str, str]]:
     raw = _r_sync.lrange(CHAT_KEY(cid), 0, -1)
     return [json.loads(x) for x in raw]
 
 
-# Expose the blocking client under the old name so
-# /history/list continues to work unchanged.
+# keep old alias used by /history routes
 _r = _r_sync
