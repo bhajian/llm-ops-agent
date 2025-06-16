@@ -61,4 +61,4 @@ def render_chat_sidebar():
                 st.rerun()
 
     st.markdown("---")
-    st.selectbox("🧠 Model", ["openai-gpt-4o", "openai-gpt-4o-mini"], key="model")
+    st.selectbox("🧠 Model", ["vllm/llama-3.1-8B", "llama4-scout"], key="model")
