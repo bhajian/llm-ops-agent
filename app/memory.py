@@ -1,65 +1,38 @@
-# app/memory.py
-"""
-Unified memory helper (sync + async)
-────────────────────────────────────
-• New preferred call:   await save_chat(cid, role="user", msg="Hi")
-• Old pair style still works: await save_chat(cid, "Hi", "Hello")
-• load_recent / load_chat unchanged
-"""
-from __future__ import annotations
-import json, os, inspect
-from typing import List, Dict
-
 import redis
-import redis.asyncio as aredis
+import json
+import logging
 
-REDIS_URL   = os.getenv("REDIS_URL", "redis://redis:6379/0")
-_r_sync     = redis.from_url(REDIS_URL, decode_responses=True)
-_r_async    = aredis.from_url(REDIS_URL, decode_responses=True)
-CHAT_KEY    = lambda cid: f"chat:{cid}"
-
-
-# ─────────────────────────────── save helpers ──────────────────────────────
-async def _push(cid: str, role: str, msg: str) -> None:
-    """Internal: append a single turn."""
-    await _r_async.rpush(CHAT_KEY(cid), json.dumps({"role": role, "msg": msg}))
+# Connect to Redis (adjust host/port/env if needed)
+_r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
-async def save_chat(cid: str, *args, **kw) -> None:
+def load_chat(chat_id: str) -> list:
     """
-    Flexible saver:
-
-    • NEW  → await save_chat(cid, role="user", msg="Hi")
-    • OLD  → await save_chat(cid, "Hi", "Hello")
-             (user-msg first, assistant-msg second)
+    Load chat history as a list of messages from Redis.
     """
-    # --- new keyword style -------------------------------------------------
-    if "role" in kw and "msg" in kw:
-        await _push(cid, kw["role"], kw["msg"])
-        return
-
-    # --- legacy two-arg style ---------------------------------------------
-    if len(args) == 2:
-        user, assistant = args          # type: ignore
-        await _push(cid, "user", user)
-        await _push(cid, "assistant", assistant)
-        return
-
-    raise TypeError(
-        "save_chat() expects (cid, role=…, msg=…)  or  (cid, user, assistant)"
-    )
+    try:
+        raw = _r.get(chat_id)
+        return json.loads(raw) if raw else []
+    except Exception as e:
+        logging.error(f"Failed to load chat {chat_id}: {e}")
+        return []
 
 
-# ───────────────────────── recent / full history ──────────────────────────
-async def load_recent(cid: str, k: int = 12) -> List[Dict[str, str]]:
-    raw = await _r_async.lrange(CHAT_KEY(cid), -k, -1)
-    return [json.loads(x) for x in raw]
+def save_chat(chat_id: str, messages: list) -> None:
+    """
+    Save chat history list of messages to Redis.
+    """
+    try:
+        _r.set(chat_id, json.dumps(messages))
+    except Exception as e:
+        logging.error(f"Failed to save chat {chat_id}: {e}")
 
 
-def load_chat(cid: str) -> List[Dict[str, str]]:
-    raw = _r_sync.lrange(CHAT_KEY(cid), 0, -1)
-    return [json.loads(x) for x in raw]
-
-
-# keep old alias used by /history routes
-_r = _r_sync
+def retrieve_from_memory(question: str) -> str:
+    """
+    Basic keyword-based retrieval from stored conversations.
+    For now, return a mock memory response. You can later extend this
+    to use vector search, semantic matching, or memory indexing.
+    """
+    # This is just a placeholder – customize per your system
+    return f"[Memory] I remember you asked something like: '{question}'"
