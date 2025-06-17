@@ -140,3 +140,29 @@ services:
     ports:
       - "8501:8501"
       
+
+  ###########################################################################
+  # vLLM – Local LLM Inference Server                                      #
+  ###########################################################################
+  # vllm:
+  #   image: vllm/vllm-openai:v0.9.1
+  #   command: >
+  #     --model meta-llama/Meta-Llama-3-8B-Instruct
+  #     --download-dir /models
+  #     --gpu-memory-utilization 0.90
+  #   environment:
+  #     HUGGING_FACE_HUB_TOKEN: "${HUGGINGFACE_HUB_TOKEN}"
+  #   ports:
+  #     - "9000:8000"
+  #   volumes:
+  #     - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+  #     - /opt/models:/models
+  #   runtime: nvidia
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - capabilities: [gpu]
+  #   ipc: host
+  #   restart: unless-stopped
+    

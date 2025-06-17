@@ -1,0 +1,58 @@
+──────────────────────────────────────────────────────────────
+Bank of Ontario – Core Banking Outage Logs (EXCERPT)
+Date: 2024-08-14
+Incident ID: BOO-IT-2024-0231
+──────────────────────────────────────────────────────────────
+
+[03:40:52] kubelet: Pod "cb-session-svc-54b7" ReadinessProbe failed: cannot connect to /health (500)
+[03:40:58] kubelet: Container "cb-transactions-api" ReadinessProbe failed: HTTP probe failed with statuscode: 503
+[03:41:03] kubelet: Failed to mount volume "core-fs-mnt": mount /dev/nfs /mnt/coredata: Input/output error
+
+[03:41:05] app-service-auth-77dfd.log:
+ERROR: auth_db lookup failed: unable to access /mnt/coredata/sessions.db (Errno 5 - I/O Error)
+
+[03:41:08] netapp-cluster-1::ONTAP-9.8P3:
+WARNING: Volume vol_corefs01: inode map corruption detected
+WARNING: Volume vol_corefs01 auto-unmounted due to fatal consistency error
+
+[03:41:10] zabbix-agent[cb-trx-07]:
+ALERT: Filesystem '/mnt/coredata' not responding for > 30s
+Trigger: BOO_FS_CORRUPT_VOLUME_VOL_COREFS01
+
+[03:41:45] kube-controller-manager:
+Eviction of pod "cb-trx-balance-6c9d" delayed due to liveness probe misconfiguration
+
+[03:42:10] Prometheus:
+ALERT[critical]: kube_pod_container_status_terminated_reason{reason="Error",pod="cb-session-svc-54b7"} = 1
+LABELS: severity="critical", service="core-banking-session", job="kubelet"
+
+[03:43:23] kubelet:
+Liveness probe for container "cb-ledger-api" failed - timeout after 60s
+
+[04:11:57] netapp-ontap-mgmt:
+FIRMWARE WARNING: ONTAP 9.8P3 encountered volume efficiency fault under volume_dedupe on vol_corefs01
+Patch: Not applied (ONTAP-ADVISORY-9.8.3-A)
+
+[04:25:14] ansible-runner:
+TASK [force umount of /mnt/coredata] FAILED: target busy (stale file handle)
+TASK [delete lockfile] FAILED: Input/output error
+
+[04:50:00] cb-monitor:
+Node cb-trx-07 still reporting 100% iowait; fs locked
+
+[07:02:00] deloitte-sre:
+NETAPP >> issuing `vol status -v` shows inode inconsistencies on vol_corefs01
+
+[08:33:51] netapp-ontap-mgmt:
+PATCH APPLIED: Firmware updated to ONTAP 9.8P11
+
+[08:56:18] ansible-runner:
+TASK [restore volume snapshot hourly-2024-08-14-0300] SUCCESS
+
+[09:12:00] cb-orchestrator:
+Re-scheduling "cb-session-svc" to DR region (GCP ca-east-1)
+
+[11:58:00] nginx-access.log:
+200 OK - /login - user_id=845822 restored from DR node cb-dr-10
+
+[12:05:00] ServiceNow Incident BOO-IT-2024-0231 updated to Status: RESOLVED
